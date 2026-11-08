@@ -1,19 +1,23 @@
-// Donnees partagees par le groupe (Firestore) + quelques reglages propres au telephone (localStorage).
+// Donnees partagees (Firestore) + quelques reglages propres au telephone (localStorage).
 //
 // Collections Firestore :
-//   sports/{id}  : { name, icon, lowerWins }
-//   players/{id} : { name, uid, mergedInto, createdBy }
-//                  uid = compte Google relie a ce joueur (ou null) ; mergedInto = joueur fusionne dans un autre
-//   games/{id}   : { date, sport, location, comments, players: [{ pid, score }], pids, createdBy, createdByName, createdAt, updatedAt }
-//   members/{uid}: { code, pid, email, name, joinedAt, revoked } ; un membre du groupe et le joueur qui le represente
-//   invites/{e-mail} : { pid } ; joueur attribue par un administrateur a un e-mail (entree sans code)
-//   config/group : { code, admins: [e-mails] } ; cree dans la console Firebase
-// Un joueur peut porter un champ email : seul ce compte pourra le revendiquer.
+//   config/group               : { admins: [e-mails] } ; cree dans la console Firebase
+//   sports/{id}                : { name, icon, lowerWins } ; communs a tous les groupes
+//   groups/{gid}               : { name, code, owner, roster: { uid: { email, name, removed } }, invites: [{ email, pid }] }
+//                                owner = responsable (createur) ; roster = membres, visibles par le responsable
+//   groups/{gid}/players/{pid} : { name, uid, email, mergedInto, createdBy }
+//                                uid = compte relie ; email = seul ce compte peut le revendiquer ; mergedInto = fusionne
+//   groups/{gid}/games/{id}    : { date, sport, location, comments, players: [{ pid, score }], pids, createdBy, createdByName, createdAt, updatedAt }
+//   joinCodes/{code}           : { group } ; code d'entree -> groupe
+//   members/{uid}              : { email, name, joinedAt, groups: [gid], pids: { gid: pid }, removed: [gid], revoked }
+//   invites/{e-mail}           : { groups: { gid: pid } } ; joueurs attribues a un e-mail par un responsable ou un administrateur
 //
+// Une meme personne a un joueur par groupe. Pour les stats sur plusieurs groupes, un joueur est identifie par sa
+// "cle" : 'u:<compte>' s'il est relie a un compte (le meme dans tous les groupes), sinon 'p:<groupe>:<joueur>'.
 // Les ecrans travaillent sur des parties "vues par un joueur" : { ...partie, me: score, opponents: [{ name, score }] }.
 import * as cloud from './cloud.js';
 
-const LOCAL = { draft: 'sl.draft', day: 'sl.day', migrated: 'sl.migrated' };
+const LOCAL = { draft: 'sl.draft', day: 'sl.day', migrated: 'sl.migrated2' };
 // Anciennes donnees, quand tout etait stocke sur le telephone
 const LEGACY = { me: 'sl.me', sports: 'sl.sports', players: 'sl.players', games: 'sl.games' };
 
@@ -39,13 +43,21 @@ export const uid = () => Date.now().toString(36) + Math.random().toString(36).sl
 const byName = (a, b) => a.localeCompare(b, 'fr');
 const normalize = (text) => text.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().trim();
 
+const playersPath = (gid) => `groups/${gid}/players`;
+const gamesPath = (gid) => `groups/${gid}/games`;
+
 // ---------------------------------------------------------------------------
-// Synchronisation
+// Etat local et synchronisation
 // ---------------------------------------------------------------------------
 
-const data = { sports: new Map(), players: new Map(), games: new Map() };
+const data = {
+  sports: new Map(),
+  groups: new Map(), // gid -> { id, name, code }
+  players: new Map(), // gid -> Map(pid -> joueur)
+  games: new Map(), // gid -> Map(id -> partie)
+};
 // Lus seulement par les administrateurs
-const admin = { members: new Map(), invites: new Map(), stops: null };
+const admin = { members: new Map() };
 let config = null;
 const session = { uid: null, user: null, member: null };
 const handlers = { change: () => {}, error: (e) => console.error(e) };
@@ -63,82 +75,180 @@ export function setSession(user, member) {
 
 const myEmail = () => (session.user?.email || '').toLowerCase();
 
-export const account = () => ({ email: session.user?.email || '', name: session.user?.displayName || '', code: config?.code || '' });
+export const account = () => ({ email: session.user?.email || '', name: session.user?.displayName || '' });
 
 export const isAdmin = () => Boolean(myEmail()) && (config?.admins || []).some((e) => String(e).toLowerCase() === myEmail());
 
 export const watchMember = (userId, callback, onError) => cloud.watchDoc('members', userId, callback, onError);
 
-// Avant d'etre membre : invitation a mon e-mail, ou administrateur ? (on peut alors entrer sans code)
-export async function canJoinWithoutCode() {
-  const [invite, cfg] = await Promise.all([cloud.getDoc('invites', myEmail()), cloud.getDoc('config', 'group')]);
-  if (cfg) config = cfg;
-  return Boolean(invite) || isAdmin();
+// Ecouteurs actifs : cle -> fonction d'arret
+const watchers = new Map();
+let sync = null; // { pending: Set, ready: boolean, onReady }
+
+function listen(key, start) {
+  if (watchers.has(key)) return;
+  if (sync && !sync.ready) sync.pending.add(key);
+  watchers.set(key, start(() => loaded(key)));
 }
 
-function startAdminSync() {
-  if (admin.stops) return;
-  admin.stops = ['members', 'invites'].map((col) =>
-    cloud.watchCollection(
-      col,
-      (docs) => {
-        admin[col] = new Map(docs.map((d) => [d.id, d]));
-        handlers.change();
-      },
-      (e) => handlers.error(e),
-    ),
-  );
+function unlisten(key) {
+  watchers.get(key)?.();
+  watchers.delete(key);
+  sync?.pending.delete(key);
 }
 
-function stopAdminSync() {
-  admin.stops?.forEach((stop) => stop());
-  admin.stops = null;
-  admin.members = new Map();
-  admin.invites = new Map();
+// Premier resultat d'un ecouteur ; une fois tout charge, onReady, puis handlers.change a chaque modification
+function loaded(key) {
+  if (!sync) return;
+  if (!sync.ready) {
+    sync.pending.delete(key);
+    if (!sync.pending.size) {
+      sync.ready = true;
+      sync.onReady();
+    }
+  } else handlers.change();
 }
 
-// Ecoute les trois collections ; onReady est appele une fois que toutes ont repondu
+const fail = (e) => handlers.error(e);
+
+// Groupes visibles : tous pour un administrateur, sinon ceux du membre
+function visibleGroups() {
+  return isAdmin() ? [...data.groups.keys()] : session.member?.groups || [];
+}
+
+// Ajuste les ecouteurs aux groupes visibles (appele quand le membre ou la liste des groupes change)
+export function refreshGroups() {
+  if (!sync) return;
+  if (isAdmin()) {
+    listen('groups', (done) =>
+      cloud.watchCollection(
+        'groups',
+        (docs) => {
+          data.groups = new Map(docs.map((d) => [d.id, d]));
+          refreshGroups();
+          done();
+        },
+        fail,
+      ),
+    );
+    for (const col of ['members']) {
+      listen(col, (done) =>
+        cloud.watchCollection(
+          col,
+          (docs) => {
+            admin[col] = new Map(docs.map((d) => [d.id, d]));
+            done();
+          },
+          fail,
+        ),
+      );
+    }
+  }
+  const wanted = new Set(visibleGroups());
+  for (const gid of wanted) {
+    if (!isAdmin()) {
+      listen(`group:${gid}`, (done) =>
+        cloud.watchDoc(
+          'groups',
+          gid,
+          (doc) => {
+            if (doc) data.groups.set(gid, doc);
+            else data.groups.delete(gid);
+            done();
+          },
+          () => done(),
+        ),
+      );
+    }
+    for (const [kind, path] of [
+      ['players', playersPath(gid)],
+      ['games', gamesPath(gid)],
+    ]) {
+      listen(`${kind}:${gid}`, (done) =>
+        cloud.watchCollection(
+          path,
+          (docs) => {
+            data[kind].set(gid, new Map(docs.map((d) => [d.id, d])));
+            done();
+          },
+          (e) => {
+            fail(e);
+            done();
+          },
+        ),
+      );
+    }
+  }
+  // Groupes quittes : on arrete d'ecouter et on oublie leurs donnees
+  for (const key of [...watchers.keys()]) {
+    const [kind, gid] = key.split(':');
+    if (gid && !wanted.has(gid)) {
+      unlisten(key);
+      data[kind === 'group' ? 'groups' : kind]?.delete(gid);
+    }
+  }
+  if (!isAdmin()) {
+    for (const col of ['groups', 'members']) unlisten(col);
+  }
+}
+
+// onReady : appele une fois que la configuration, les sports et les groupes visibles ont repondu
 export function startSync(onReady) {
-  const pending = new Set(Object.keys(data));
-  const stopConfig = cloud.watchDoc(
-    'config',
-    'group',
-    (doc) => {
-      config = doc;
-      if (isAdmin()) startAdminSync();
-      else stopAdminSync();
-      if (!pending.size) handlers.change();
-    },
-    () => {},
-  );
-  const stops = Object.keys(data).map((col) =>
-    cloud.watchCollection(
-      col,
-      (docs) => {
-        data[col] = new Map(docs.map((d) => [d.id, d]));
-        if (pending.size) {
-          pending.delete(col);
-          if (!pending.size) onReady();
-        } else handlers.change();
+  sync = { pending: new Set(), ready: false, onReady };
+  listen('config', (done) =>
+    cloud.watchDoc(
+      'config',
+      'group',
+      (doc) => {
+        config = doc;
+        refreshGroups();
+        done();
       },
-      (e) => handlers.error(e),
+      () => done(),
     ),
   );
+  listen('sports', (done) =>
+    cloud.watchCollection(
+      'sports',
+      (docs) => {
+        data.sports = new Map(docs.map((d) => [d.id, d]));
+        done();
+      },
+      fail,
+    ),
+  );
+  refreshGroups();
   return () => {
-    stops.forEach((stop) => stop());
-    stopConfig();
-    stopAdminSync();
+    for (const key of [...watchers.keys()]) unlisten(key);
+    sync = null;
     config = null;
-    for (const col of Object.keys(data)) data[col] = new Map();
+    data.sports = new Map();
+    data.groups = new Map();
+    data.players = new Map();
+    data.games = new Map();
+    admin.members = new Map();
   };
+}
+
+// Map locale correspondant a une collection Firestore
+function localMap(col) {
+  if (col === 'sports' || col === 'groups') return data[col];
+  if (col === 'members') return admin.members;
+  const m = col.match(/^groups\/([^/]+)\/(players|games)$/);
+  if (!m) return null;
+  const [, gid, kind] = m;
+  if (!data[kind].has(gid)) data[kind].set(gid, new Map());
+  return data[kind].get(gid);
 }
 
 // Applique les modifications tout de suite en local, puis les envoie.
 // Si le serveur refuse, Firestore annule et l'ecran se remet a jour tout seul.
 function commit(ops) {
   for (const op of ops) {
-    const map = { ...data, members: admin.members, invites: admin.invites }[op.col];
-    if (!map) continue;
+    const map = localMap(op.col);
+    // Operations ciblees ("a.b", ajout a une liste...) : on attend la reponse de Firestore, deja tres rapide en local
+    const targeted = op.type === 'merge' || (op.data && Object.entries(op.data).some(([k, v]) => k.includes('.') || v?.__t));
+    if (!map || targeted) continue;
     if (op.type === 'set') map.set(op.id, { id: op.id, ...op.data });
     else if (op.type === 'update') map.set(op.id, { ...map.get(op.id), ...op.data });
     else map.delete(op.id);
@@ -154,191 +264,402 @@ async function commitInChunks(ops, size = 400) {
 }
 
 // ---------------------------------------------------------------------------
-// Joueurs
+// Groupes
 // ---------------------------------------------------------------------------
 
+// Operations ciblees (voir cloud.write)
+const T = {
+  union: (...v) => ({ __t: 'union', v }),
+  remove: (...v) => ({ __t: 'remove', v }),
+  del: () => ({ __t: 'del' }),
+};
+
+// Responsable du groupe (celui qui l'a cree) ou administrateur : peut gerer le groupe
+export const canManage = (gid) => isAdmin() || (Boolean(session.uid) && data.groups.get(gid)?.owner === session.uid && !session.member?.revoked);
+
+// Peut creer un groupe : administrateur, ou membre d'au moins un groupe
+export const canCreateGroup = () => isAdmin() || (session.member?.groups || []).length > 0;
+
+// Groupes que je vois : { id, name, code, mine (j'en suis membre), pid (mon joueur), manage (je le gere), ownerName }
+export function getGroups() {
+  const mine = new Set(session.member?.groups || []);
+  return visibleGroups()
+    .map((gid) => {
+      const g = data.groups.get(gid);
+      return {
+        id: gid,
+        name: g?.name || '…',
+        code: g?.code || '',
+        mine: mine.has(gid),
+        pid: myPid(gid),
+        manage: canManage(gid),
+        ownerName: g?.roster?.[g?.owner]?.name || '',
+      };
+    })
+    .sort((a, b) => byName(a.name, b.name));
+}
+
+export const groupName = (gid) => data.groups.get(gid)?.name || '…';
+
+// Groupes ou je peux saisir : ceux dont je suis membre avec un joueur, et ceux que je gere
+export const writableGroups = () => getGroups().filter((g) => g.manage || (g.mine && g.pid));
+
+// Groupes dont je suis membre mais ou je n'ai pas encore choisi mon joueur
+export const groupsWithoutPlayer = () => getGroups().filter((g) => g.mine && !g.pid);
+
+// ---------------------------------------------------------------------------
+// Rejoindre un groupe (attend le serveur)
+// ---------------------------------------------------------------------------
+
+// Ecrit le membre en ajoutant un groupe (la regle verifie le code, l'invitation ou le role d'administrateur)
+function addGroupToMember(gid, joinCode = '') {
+  const u = session.user;
+  const m = session.member;
+  const groups = [...new Set([...(m?.groups || []), ...(gid ? [gid] : [])])];
+  const ops = m
+    ? [{ type: 'update', col: 'members', id: u.uid, data: { groups, joining: gid, joinCode } }]
+    : [
+        {
+          type: 'set',
+          col: 'members',
+          id: u.uid,
+          data: { email: myEmail(), name: u.displayName || '', joinedAt: new Date().toISOString(), groups, pids: {}, removed: [], revoked: false, joining: gid || null, joinCode },
+        },
+      ];
+  // Je m'inscris dans la liste des membres du groupe (visible par son responsable)
+  if (gid) ops.push({ type: 'update', col: 'groups', id: gid, data: { [`roster.${u.uid}`]: rosterEntry() } });
+  return cloud.write(ops);
+}
+
+const rosterEntry = () => ({ email: myEmail(), name: session.user?.displayName || '', removed: false });
+
+export async function joinWithCode(code) {
+  const clean = code.trim();
+  if (!clean) throw new Error('Saisis le code du groupe.');
+  const entry = await cloud.getDoc('joinCodes', clean);
+  if (!entry?.group) throw new Error('Code incorrect.');
+  if (session.member?.groups?.includes(entry.group)) throw new Error('Tu fais déjà partie de ce groupe.');
+  await addGroupToMember(entry.group, clean);
+}
+
+// Premiere connexion : invitations a mon e-mail, administrateur ?
+// Rejoint les groupes ou je suis invite (un par un, comme l'exigent les regles). Renvoie true si je suis entre.
+export async function joinWithoutCode() {
+  const [invite, cfg] = await Promise.all([cloud.getDoc('invites', myEmail()), cloud.getDoc('config', 'group')]);
+  if (cfg) config = cfg;
+  const invited = Object.keys(invite?.groups || {}).filter((gid) => !session.member?.groups?.includes(gid));
+  if (!invited.length && !isAdmin()) return false;
+  if (!invited.length) {
+    await addGroupToMember(null);
+    return true;
+  }
+  for (const gid of invited) {
+    await addGroupToMember(gid);
+    session.member = { ...(session.member || {}), groups: [...(session.member?.groups || []), gid], pids: session.member?.pids || {} };
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Joueurs (propres a chaque groupe)
+// ---------------------------------------------------------------------------
+
+const playersOf = (gid) => data.players.get(gid) || new Map();
+
 // Suit les fusions jusqu'au joueur final
-function resolve(pid) {
+function resolve(gid, pid) {
   let id = pid;
   for (let i = 0; i < 20; i += 1) {
-    const next = data.players.get(id)?.mergedInto;
+    const next = playersOf(gid).get(id)?.mergedInto;
     if (!next) break;
     id = next;
   }
   return id;
 }
 
-const nameOf = (pid) => data.players.get(resolve(pid))?.name || '?';
-const activePlayers = () => [...data.players.values()].filter((p) => !p.mergedInto && typeof p.name === 'string');
-const findPlayer = (name) => {
+const nameOf = (gid, pid) => playersOf(gid).get(resolve(gid, pid))?.name || '?';
+
+function keyOf(gid, pid) {
+  const id = resolve(gid, pid);
+  const p = playersOf(gid).get(id);
+  return p?.uid ? `u:${p.uid}` : `p:${gid}:${id}`;
+}
+
+const activePlayers = (gid) => [...playersOf(gid).values()].filter((p) => !p.mergedInto && typeof p.name === 'string');
+const findPlayer = (gid, name) => {
   const n = normalize(name);
-  return activePlayers().find((p) => normalize(p.name) === n) || null;
+  return activePlayers(gid).find((p) => normalize(p.name) === n) || null;
 };
 
-export const myPid = () => session.member?.pid || null;
-export const getMe = () => (myPid() ? nameOf(myPid()) : '');
-export const pidOf = (name) => findPlayer(name)?.id || null;
+export const myKey = () => (session.uid ? `u:${session.uid}` : null);
+export const myPid = (gid) => session.member?.pids?.[gid] || null;
 
-export function getPlayers() {
-  return activePlayers()
+// Mon nom de joueur dans un groupe (ou dans le premier groupe ou j'en ai un)
+export function getMe(gid) {
+  if (gid && myPid(gid)) return nameOf(gid, myPid(gid));
+  const any = Object.entries(session.member?.pids || {}).find(([g]) => data.players.has(g));
+  return any ? nameOf(any[0], any[1]) : session.user?.displayName?.split(' ')[0] || '';
+}
+
+export const pidOf = (gid, name) => findPlayer(gid, name)?.id || null;
+
+export function getPlayers(gid) {
+  return activePlayers(gid)
     .map((p) => p.name)
     .sort(byName);
 }
 
 // Pour les reglages : { pid, name, linked, mine, email }
-export function getPlayerDetails() {
-  return activePlayers()
-    .map((p) => ({ pid: p.id, name: p.name, linked: Boolean(p.uid), mine: p.id === myPid(), email: p.email || '' }))
+export function getPlayerDetails(gid) {
+  return activePlayers(gid)
+    .map((p) => ({ pid: p.id, name: p.name, linked: Boolean(p.uid), mine: p.uid === session.uid, email: p.email || '' }))
     .sort((a, b) => byName(a.name, b.name));
 }
 
 // Joueurs que je peux revendiquer : pas encore relies a un compte, ni attribues a un autre e-mail
-export const unclaimedPlayers = () => getPlayerDetails().filter((p) => !p.linked && (!p.email || p.email === myEmail()));
+export const unclaimedPlayers = (gid) => getPlayerDetails(gid).filter((p) => !p.linked && (!p.email || p.email === myEmail()));
 
 // Joueur qu'un administrateur m'a attribue (par mon e-mail)
-export const assignedPlayer = () => getPlayerDetails().find((p) => !p.linked && p.email && p.email === myEmail()) || null;
+export const assignedPlayer = (gid) => getPlayerDetails(gid).find((p) => !p.linked && p.email && p.email === myEmail()) || null;
 
-// Trouve le joueur par son nom, ou le cree (operation ajoutee a ops)
-function ensurePlayer(name, ops) {
+// Trouve le joueur par son nom dans le groupe, ou le cree (operation ajoutee a ops)
+function ensurePlayer(gid, name, ops) {
   const clean = name.trim();
-  const found = findPlayer(clean);
+  const found = findPlayer(gid, clean);
   if (found) return found.id;
   const id = uid();
-  const player = { name: clean, uid: null, mergedInto: null, createdBy: session.uid };
-  data.players.set(id, { id, ...player });
-  ops.push({ type: 'set', col: 'players', id, data: player });
+  const player = { name: clean, uid: null, email: null, mergedInto: null, createdBy: session.uid };
+  localMap(playersPath(gid)).set(id, { id, ...player });
+  ops.push({ type: 'set', col: playersPath(gid), id, data: player });
   return id;
 }
 
-export function addPlayer(name) {
+export function addPlayer(gid, name) {
   if (!name.trim()) return;
   const ops = [];
-  ensurePlayer(name, ops);
+  ensurePlayer(gid, name, ops);
   if (ops.length) commit(ops);
 }
 
-// Renomme le joueur. Si le nouveau nom existe deja, les deux joueurs sont fusionnes.
-export function renamePlayer(from, to) {
+// Renomme le joueur. Si le nouveau nom existe deja dans le groupe, les deux joueurs sont fusionnes.
+export function renamePlayer(gid, from, to) {
   const clean = to.trim();
-  const player = findPlayer(from);
+  const player = findPlayer(gid, from);
   if (!clean || !player || clean === player.name) return;
-  const target = findPlayer(clean);
+  const target = findPlayer(gid, clean);
   if (target && target.id !== player.id) {
     if (player.uid) throw new Error(`« ${player.name} » est relié à un compte : renomme plutôt « ${target.name} » en « ${player.name} ».`);
-    commit([{ type: 'update', col: 'players', id: player.id, data: { mergedInto: target.id } }]);
+    commit([{ type: 'update', col: playersPath(gid), id: player.id, data: { mergedInto: target.id } }]);
     return;
   }
-  if (player.uid && player.uid !== session.uid && !isAdmin()) throw new Error(`« ${player.name} » est relié au compte d'un autre membre : lui seul peut changer son nom.`);
-  commit([{ type: 'update', col: 'players', id: player.id, data: { name: clean } }]);
+  if (player.uid && player.uid !== session.uid && !canManage(gid)) throw new Error(`« ${player.name} » est relié au compte d'un autre membre : lui seul peut changer son nom.`);
+  commit([{ type: 'update', col: playersPath(gid), id: player.id, data: { name: clean } }]);
 }
 
 // Impossible s'il apparait dans une partie ou s'il est relie a un compte (verifie par l'interface)
-export function removePlayer(name) {
-  const player = findPlayer(name);
-  if (player && !player.uid) commit([{ type: 'delete', col: 'players', id: player.id }]);
+export function removePlayer(gid, name) {
+  const player = findPlayer(gid, name);
+  if (player && !player.uid) commit([{ type: 'delete', col: playersPath(gid), id: player.id }]);
+}
+
+// Me relier a un joueur du groupe (existant ou cree) ; la regle exige le champ "linking"
+function linkMe(gid, pid, ops) {
+  const pids = { ...(session.member?.pids || {}), [gid]: pid };
+  ops.push({ type: 'update', col: playersPath(gid), id: pid, data: { uid: session.uid } });
+  ops.push({ type: 'update', col: 'members', id: session.uid, data: { pids, linking: gid } });
+  return commit(ops);
+}
+
+export const claimPlayer = (gid, pid) => linkMe(gid, pid, []);
+
+export function createMyPlayer(gid, name) {
+  const clean = name.trim();
+  if (!clean) return Promise.reject(new Error('Donne ton nom de joueur.'));
+  if (findPlayer(gid, clean)) return Promise.reject(new Error(`« ${clean} » existe déjà : choisis-le dans la liste.`));
+  const id = uid();
+  const ops = [{ type: 'set', col: playersPath(gid), id, data: { name: clean, uid: null, email: null, mergedInto: null, createdBy: session.uid } }];
+  return linkMe(gid, id, ops);
 }
 
 // ---------------------------------------------------------------------------
-// Administration (refuse par le serveur pour les autres membres)
+// Gestion des groupes : par leur responsable ou un administrateur (verifie par le serveur)
 // ---------------------------------------------------------------------------
 
-// Membres : { uid, name, email, pid, playerName, revoked, me }
-export function getMembers() {
-  return [...admin.members.values()]
-    .map((m) => ({ uid: m.id, name: m.name || '', email: m.email || '', pid: m.pid || null, playerName: m.pid ? nameOf(m.pid) : '', revoked: Boolean(m.revoked), me: m.id === session.uid }))
-    .sort((a, b) => byName(a.playerName || a.email, b.playerName || b.email));
+// Cree un groupe dont je deviens le responsable et un membre
+export async function createGroup(name, code) {
+  const cleanName = name.trim();
+  const cleanCode = code.trim();
+  if (!cleanName) throw new Error('Donne un nom au groupe.');
+  if (!cleanCode) throw new Error('Choisis un code pour le groupe.');
+  if (/[/]/.test(cleanCode)) throw new Error('Le code ne peut pas contenir « / ».');
+  if (!canCreateGroup()) throw new Error('Rejoins d’abord un groupe pour pouvoir en créer.');
+  if (await cloud.getDoc('joinCodes', cleanCode)) throw new Error('Ce code est déjà utilisé par un autre groupe.');
+  const gid = uid();
+  await commit([
+    {
+      type: 'set',
+      col: 'groups',
+      id: gid,
+      data: { name: cleanName, code: cleanCode, owner: session.uid, roster: { [session.uid]: rosterEntry() }, invites: [], createdAt: new Date().toISOString() },
+    },
+    { type: 'set', col: 'joinCodes', id: cleanCode, data: { group: gid } },
+    { type: 'update', col: 'members', id: session.uid, data: { groups: T.union(gid), joining: gid, joinCode: cleanCode } },
+  ]);
+  return gid;
 }
 
-// Invitations : { email, pid, playerName, joined }
-export function getInvites() {
-  const joined = new Set([...admin.members.values()].map((m) => (m.email || '').toLowerCase()));
-  return [...admin.invites.values()]
-    .map((i) => ({ email: i.id, pid: i.pid, playerName: i.pid ? nameOf(i.pid) : '?', joined: joined.has(i.id) }))
+export function renameGroup(gid, name) {
+  if (!name.trim()) throw new Error('Donne un nom au groupe.');
+  commit([{ type: 'update', col: 'groups', id: gid, data: { name: name.trim() } }]);
+}
+
+export async function setGroupCode(gid, code) {
+  const clean = code.trim();
+  if (!clean) throw new Error('Le code ne peut pas être vide.');
+  if (/[/]/.test(clean)) throw new Error('Le code ne peut pas contenir « / ».');
+  const group = data.groups.get(gid);
+  if (group?.code === clean) return;
+  if (await cloud.getDoc('joinCodes', clean)) throw new Error('Ce code est déjà utilisé par un autre groupe.');
+  const ops = [
+    { type: 'update', col: 'groups', id: gid, data: { code: clean } },
+    { type: 'set', col: 'joinCodes', id: clean, data: { group: gid } },
+  ];
+  if (group?.code) ops.push({ type: 'delete', col: 'joinCodes', id: group.code });
+  await commit(ops);
+}
+
+// Joueur d'un membre dans un groupe (celui qui est relie a son compte)
+const playerOfUser = (gid, userId) => activePlayers(gid).find((p) => p.uid === userId) || null;
+
+// Membres d'un groupe : [{ uid, email, name, removed, playerName, owner, me }]
+export function getGroupMembers(gid) {
+  const g = data.groups.get(gid);
+  return Object.entries(g?.roster || {})
+    .map(([id, r]) => ({
+      uid: id,
+      email: r.email || '',
+      name: r.name || '',
+      removed: Boolean(r.removed),
+      playerName: playerOfUser(gid, id)?.name || '',
+      owner: id === g.owner,
+      me: id === session.uid,
+    }))
+    .sort((a, b) => Number(a.removed) - Number(b.removed) || byName(a.playerName || a.email, b.playerName || b.email));
+}
+
+// Retire un membre du groupe : il ne pourra pas y revenir avec le code ; son joueur redevient libre
+export function removeFromGroup(memberUid, gid) {
+  if (memberUid === session.uid) throw new Error('Tu ne peux pas te retirer toi-même.');
+  if (memberUid === data.groups.get(gid)?.owner && !isAdmin()) throw new Error('Le responsable ne peut pas être retiré.');
+  const ops = [];
+  const player = playerOfUser(gid, memberUid);
+  if (player) ops.push({ type: 'update', col: playersPath(gid), id: player.id, data: { uid: null } });
+  ops.push({
+    type: 'update',
+    col: 'members',
+    id: memberUid,
+    data: { groups: T.remove(gid), removed: T.union(gid), [`pids.${gid}`]: T.del(), managing: gid },
+  });
+  ops.push({ type: 'update', col: 'groups', id: gid, data: { [`roster.${memberUid}.removed`]: true } });
+  commit(ops);
+}
+
+// Remet dans le groupe un membre retire
+export function addToGroup(memberUid, gid) {
+  commit([
+    { type: 'update', col: 'members', id: memberUid, data: { groups: T.union(gid), removed: T.remove(gid), managing: gid } },
+    { type: 'update', col: 'groups', id: gid, data: { [`roster.${memberUid}.removed`]: false } },
+  ]);
+}
+
+// Relie un membre du groupe a un joueur (existant ou cree) ; son ancien joueur redevient libre
+export function linkMember(memberUid, gid, playerName) {
+  const existing = findPlayer(gid, playerName);
+  if (existing?.uid && existing.uid !== memberUid) throw new Error(`« ${existing.name} » est déjà relié à un autre membre.`);
+  const roster = data.groups.get(gid)?.roster?.[memberUid];
+  const ops = [];
+  const pid = ensurePlayer(gid, playerName, ops);
+  const old = playerOfUser(gid, memberUid);
+  if (old && old.id !== pid) ops.push({ type: 'update', col: playersPath(gid), id: old.id, data: { uid: null } });
+  ops.push({ type: 'update', col: playersPath(gid), id: pid, data: { uid: memberUid, email: roster?.email || null } });
+  ops.push({
+    type: 'update',
+    col: 'members',
+    id: memberUid,
+    data: { [`pids.${gid}`]: pid, groups: T.union(gid), removed: T.remove(gid), managing: gid },
+  });
+  ops.push({ type: 'update', col: 'groups', id: gid, data: { [`roster.${memberUid}.removed`]: false } });
+  commit(ops);
+}
+
+// Membre du groupe ayant cet e-mail (pour relier directement au lieu d'inviter)
+export const memberByEmail = (gid, email) => getGroupMembers(gid).find((m) => m.email.toLowerCase() === email.trim().toLowerCase()) || null;
+
+// Invitations d'un groupe : [{ email, pid, playerName, joined }]
+export function getGroupInvites(gid) {
+  const g = data.groups.get(gid);
+  const joined = new Set(Object.values(g?.roster || {}).filter((r) => !r.removed).map((r) => (r.email || '').toLowerCase()));
+  return (g?.invites || [])
+    .map((i) => ({ email: i.email, pid: i.pid, playerName: nameOf(gid, i.pid), joined: joined.has(i.email) }))
     .sort((a, b) => byName(a.email, b.email));
 }
 
-export function setGroupCode(code) {
-  if (!code.trim()) throw new Error('Le code ne peut pas être vide.');
-  commit([{ type: 'update', col: 'config', id: 'group', data: { code: code.trim() } }]);
+// Attribue un joueur du groupe (existant ou cree) a un e-mail : la personne entrera dans ce groupe sans code
+export function inviteEmail(email, gid, playerName) {
+  const clean = email.trim().toLowerCase();
+  if (!/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/.test(clean)) throw new Error('Adresse e-mail invalide.');
+  if (!playerName.trim()) throw new Error('Choisis un nom de joueur.');
+  const existing = findPlayer(gid, playerName);
+  if (existing?.uid) throw new Error(`« ${existing.name} » est déjà relié à un compte.`);
+  const ops = [];
+  const pid = ensurePlayer(gid, playerName, ops);
+  const invites = data.groups.get(gid)?.invites || [];
+  const previous = invites.find((i) => i.email === clean);
+  if (previous && previous.pid !== pid) ops.push({ type: 'update', col: playersPath(gid), id: previous.pid, data: { email: null } });
+  ops.push({ type: 'update', col: playersPath(gid), id: pid, data: { email: clean } });
+  ops.push({ type: 'merge', col: 'invites', id: clean, data: { groups: { [gid]: pid }, managing: gid } });
+  ops.push({ type: 'update', col: 'groups', id: gid, data: { invites: [...invites.filter((i) => i.email !== clean), { email: clean, pid }] } });
+  commit(ops);
 }
 
+export function removeInvite(email, gid) {
+  const invites = data.groups.get(gid)?.invites || [];
+  const invite = invites.find((i) => i.email === email);
+  const ops = [
+    { type: 'update', col: 'invites', id: email, data: { [`groups.${gid}`]: T.del(), managing: gid } },
+    { type: 'update', col: 'groups', id: gid, data: { invites: invites.filter((i) => i.email !== email) } },
+  ];
+  const player = invite && playersOf(gid).get(invite.pid);
+  if (player && !player.uid && player.email === email) ops.push({ type: 'update', col: playersPath(gid), id: player.id, data: { email: null } });
+  commit(ops);
+}
+
+// ---------------------------------------------------------------------------
+// Administration generale (administrateurs seulement)
+// ---------------------------------------------------------------------------
+
+// Tous les membres : { uid, name, email, revoked, me, groups: [noms des groupes] }
+export function getMembers() {
+  return [...admin.members.values()]
+    .map((m) => ({
+      uid: m.id,
+      name: m.name || '',
+      email: m.email || '',
+      revoked: Boolean(m.revoked),
+      me: m.id === session.uid,
+      groups: (m.groups || []).map((gid) => groupName(gid)),
+    }))
+    .sort((a, b) => byName(a.name || a.email, b.name || b.email));
+}
+
+// Revoque (ou retablit) l'acces d'un membre a tous les groupes
 export function setRevoked(memberUid, revoked) {
   if (memberUid === session.uid) throw new Error('Tu ne peux pas te révoquer toi-même.');
   commit([{ type: 'update', col: 'members', id: memberUid, data: { revoked } }]);
 }
 
-// Relie un membre a un joueur (existant ou cree avec ce nom) ; son ancien joueur redevient libre
-export function linkMember(memberUid, playerName) {
-  const m = admin.members.get(memberUid);
-  if (!m) return;
-  const existing = findPlayer(playerName);
-  if (existing?.uid && existing.uid !== memberUid) throw new Error(`« ${existing.name} » est déjà relié à un autre membre.`);
-  const ops = [];
-  const pid = ensurePlayer(playerName, ops);
-  if (m.pid && m.pid !== pid) ops.push({ type: 'update', col: 'players', id: m.pid, data: { uid: null } });
-  ops.push({ type: 'update', col: 'players', id: pid, data: { uid: memberUid, email: (m.email || '').toLowerCase() || null } });
-  ops.push({ type: 'update', col: 'members', id: memberUid, data: { pid } });
-  commit(ops);
-}
-
-// Attribue un joueur (existant ou cree avec ce nom) a un e-mail : la personne entrera sans code avec ce joueur
-export function inviteEmail(email, playerName) {
-  const clean = email.trim().toLowerCase();
-  if (!/^[^\s@/]+@[^\s@/]+\.[^\s@/]+$/.test(clean)) throw new Error('Adresse e-mail invalide.');
-  if (!playerName.trim()) throw new Error('Choisis un nom de joueur.');
-  const existing = findPlayer(playerName);
-  if (existing?.uid) throw new Error(`« ${existing.name} » est déjà relié à un compte.`);
-  const ops = [];
-  const pid = ensurePlayer(playerName, ops);
-  const previous = admin.invites.get(clean);
-  if (previous?.pid && previous.pid !== pid) ops.push({ type: 'update', col: 'players', id: previous.pid, data: { email: null } });
-  ops.push({ type: 'update', col: 'players', id: pid, data: { email: clean } });
-  ops.push({ type: 'set', col: 'invites', id: clean, data: { pid } });
-  commit(ops);
-}
-
-export function removeInvite(email) {
-  const invite = admin.invites.get(email);
-  const ops = [{ type: 'delete', col: 'invites', id: email }];
-  const player = invite?.pid && data.players.get(invite.pid);
-  if (player && !player.uid && player.email === email) ops.push({ type: 'update', col: 'players', id: player.id, data: { email: null } });
-  commit(ops);
-}
-
-// --- Rejoindre le groupe et choisir son joueur (attend le serveur) ---
-
-export function joinGroup(code) {
-  const u = session.user;
-  return cloud.write([
-    {
-      type: 'set',
-      col: 'members',
-      id: u.uid,
-      data: { code: code.trim(), pid: null, email: u.email || '', name: u.displayName || '', joinedAt: new Date().toISOString() },
-    },
-  ]);
-}
-
-export function claimPlayer(pid) {
-  return commit([
-    { type: 'update', col: 'players', id: pid, data: { uid: session.uid } },
-    { type: 'update', col: 'members', id: session.uid, data: { pid } },
-  ]);
-}
-
-export function createMyPlayer(name) {
-  const clean = name.trim();
-  if (!clean) return Promise.reject(new Error('Donne ton nom de joueur.'));
-  if (findPlayer(clean)) return Promise.reject(new Error(`« ${clean} » existe déjà : choisis-le dans la liste.`));
-  const id = uid();
-  return commit([
-    { type: 'set', col: 'players', id, data: { name: clean, uid: session.uid, mergedInto: null, createdBy: session.uid } },
-    { type: 'update', col: 'members', id: session.uid, data: { pid: id } },
-  ]);
-}
-
 // ---------------------------------------------------------------------------
-// Sports et jeux : { id, name, icon, lowerWins }
+// Sports et jeux : { id, name, icon, lowerWins } ; communs a tous les groupes
 // ---------------------------------------------------------------------------
 
 export function getSports() {
@@ -361,49 +682,65 @@ export function deleteSport(id) {
 // Parties
 // ---------------------------------------------------------------------------
 
-// Partie avec les noms des joueurs (fusions resolues)
-function view(g) {
+// Partie avec son groupe et les noms des joueurs (fusions resolues)
+function view(gid, g) {
   return {
     ...g,
-    players: (g.players || []).map((p) => ({ pid: resolve(p.pid), name: nameOf(p.pid), score: p.score })),
+    group: gid,
+    players: (g.players || []).map((p) => ({ pid: resolve(gid, p.pid), key: keyOf(gid, p.pid), name: nameOf(gid, p.pid), score: p.score })),
   };
 }
 
-// Partie vue par un joueur, ou null s'il n'y a pas participe
-export function perspective(g, pid) {
-  const me = g.players.find((p) => p.pid === pid);
+// Partie vue par un joueur (par sa cle), ou null s'il n'y a pas participe
+export function perspective(g, key) {
+  const me = g.players.find((p) => p.key === key);
   if (!me) return null;
   return { ...g, me: me.score, opponents: g.players.filter((p) => p !== me).map(({ name, score }) => ({ name, score })) };
 }
 
-// Toutes les parties du groupe
-export function getAllGames() {
-  return [...data.games.values()].filter((g) => Array.isArray(g.players)).map(view);
+// Toutes les parties visibles ; groupId : un seul groupe, ou '' pour tous
+export function getAllGames(groupId = '') {
+  const list = [];
+  for (const [gid, games] of data.games) {
+    if (groupId && gid !== groupId) continue;
+    for (const g of games.values()) if (Array.isArray(g.players)) list.push(view(gid, g));
+  }
+  return list;
 }
 
 // Parties d'un joueur (moi par defaut), de son point de vue
-export function getGames(pid = myPid()) {
-  if (!pid) return [];
-  return getAllGames()
-    .map((g) => perspective(g, pid))
+export function getGames(key = myKey(), groupId = '') {
+  if (!key) return [];
+  return getAllGames(groupId)
+    .map((g) => perspective(g, key))
     .filter(Boolean);
 }
 
-// Meme regle que firestore.rules : l'auteur, les joueurs de la partie et les administrateurs
-export function canEdit(g) {
-  return isAdmin() || g.createdBy === session.uid || (g.pids || []).includes(myPid());
+// Joueurs presents dans des parties : [{ key, name }] (pour choisir les stats a afficher)
+export function getPlayerKeys(groupId = '') {
+  const map = new Map();
+  for (const g of getAllGames(groupId)) for (const p of g.players) if (!map.has(p.key)) map.set(p.key, p.name);
+  return [...map.entries()].map(([key, name]) => ({ key, name })).sort((a, b) => byName(a.name, b.name));
 }
 
-// record : { id, createdAt, date, location, sport, me, opponents: [{ name, score }], comments, owner }
-// owner : joueur dont "me" est le score (moi par defaut ; un administrateur peut modifier la partie d'un autre)
+// Meme regle que firestore.rules : l'auteur, les joueurs de la partie, le responsable du groupe et les administrateurs
+export function canEdit(g) {
+  return canManage(g.group) || g.createdBy === session.uid || (g.pids || []).includes(myPid(g.group));
+}
+
+// record : { id, group, createdAt, date, location, sport, me, opponents: [{ name, score }], comments, owner }
+// owner : joueur dont "me" est le score (moi par defaut ; un administrateur peut saisir pour un autre)
 export function saveGame(record) {
+  const gid = record.group;
+  if (!gid) throw new Error('Choisis le groupe.');
   const ops = [];
-  const ownerPid = record.owner ? ensurePlayer(record.owner, ops) : myPid();
-  const players = [
-    { pid: ownerPid, score: record.me },
-    ...record.opponents.map((o) => ({ pid: ensurePlayer(o.name, ops), score: o.score })),
-  ];
-  const previous = record.id ? data.games.get(record.id) : null;
+  const ownerPid = record.owner ? ensurePlayer(gid, record.owner, ops) : myPid(gid);
+  if (!ownerPid) throw new Error(`Choisis d’abord ton joueur dans « ${groupName(gid)} », ou saisis la partie pour un autre joueur.`);
+  const players = [{ pid: ownerPid, score: record.me }, ...record.opponents.map((o) => ({ pid: ensurePlayer(gid, o.name, ops), score: o.score }))];
+  // Partie deplacee vers un autre groupe : on la retire de l'ancien
+  const fromGroup = record.id ? [...data.games.keys()].find((g) => data.games.get(g).has(record.id)) : null;
+  const previous = fromGroup ? data.games.get(fromGroup).get(record.id) : null;
+  if (fromGroup && fromGroup !== gid) ops.push({ type: 'delete', col: gamesPath(fromGroup), id: record.id });
   const now = new Date().toISOString();
   const id = record.id || uid();
   const game = {
@@ -414,17 +751,17 @@ export function saveGame(record) {
     players,
     pids: players.map((p) => p.pid),
     createdBy: previous?.createdBy || session.uid,
-    createdByName: previous?.createdByName || getMe(),
+    createdByName: previous?.createdByName || getMe(gid),
     createdAt: record.createdAt || now,
     updatedAt: now,
   };
-  ops.push({ type: 'set', col: 'games', id, data: game });
+  ops.push({ type: 'set', col: gamesPath(gid), id, data: game });
   commit(ops);
-  return { id, ...game };
+  return view(gid, { id, ...game });
 }
 
-export function deleteGame(id) {
-  commit([{ type: 'delete', col: 'games', id }]);
+export function deleteGame(gid, id) {
+  commit([{ type: 'delete', col: gamesPath(gid), id }]);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,11 +769,15 @@ export function deleteGame(id) {
 // ---------------------------------------------------------------------------
 
 export function exportBackup() {
-  const strip = (map) => [...map.values()];
-  return { app: 'score-logger', version: 2, exportedAt: new Date().toISOString(), sports: strip(data.sports), players: strip(data.players), games: strip(data.games) };
+  const groups = [...data.groups.values()].map((g) => ({
+    ...g,
+    players: [...playersOf(g.id).values()],
+    games: [...(data.games.get(g.id) || new Map()).values()],
+  }));
+  return { app: 'score-logger', version: 3, exportedAt: new Date().toISOString(), sports: [...data.sports.values()], groups };
 }
 
-// Parties encore stockees sur ce telephone et pas encore envoyees au groupe
+// Parties encore stockees sur ce telephone et pas encore envoyees
 export function legacyBackup() {
   if (read(LOCAL.migrated, false)) return null;
   const games = read(LEGACY.games, []);
@@ -447,12 +788,13 @@ export function legacyBackup() {
 export const legacyName = () => read(LEGACY.me, '');
 export const markMigrated = () => writeLocal(LOCAL.migrated, true);
 
-// Envoie au groupe des parties au format version 1 (fichier JSON ou anciennes donnees du telephone).
-// Dans ces parties, "me" est le joueur connecte. Les sports et joueurs sont rapproches par leur nom.
-export async function importLegacy(backup) {
-  if (backup?.version === 2) throw new Error('Ce fichier est une sauvegarde du groupe entier : il sert d’archive et ne se réimporte pas.');
+// Envoie dans un groupe des parties au format version 1 (fichier JSON ou anciennes donnees du telephone).
+// Dans ces parties, "me" est mon joueur dans ce groupe. Les sports et joueurs sont rapproches par leur nom.
+export async function importLegacy(backup, gid) {
+  if (backup?.version >= 2) throw new Error('Ce fichier est une sauvegarde complète : il sert d’archive et ne se réimporte pas.');
   if (!backup || !Array.isArray(backup.games)) throw new Error('Fichier invalide : liste "games" absente');
-  if (!myPid()) throw new Error('Choisis d’abord ton joueur.');
+  if (!gid) throw new Error('Choisis le groupe.');
+  if (!myPid(gid)) throw new Error(`Choisis d’abord ton joueur dans « ${groupName(gid)} ».`);
   const ops = [];
 
   const sportIds = new Map();
@@ -467,8 +809,9 @@ export async function importLegacy(backup) {
       sportIds.set(s.id, s.id);
     }
   }
-  for (const n of backup.players || []) if (typeof n === 'string' && n.trim()) ensurePlayer(n, ops);
+  for (const n of backup.players || []) if (typeof n === 'string' && n.trim()) ensurePlayer(gid, n, ops);
 
+  const games = data.games.get(gid) || new Map();
   let added = 0;
   let updated = 0;
   let ignored = 0;
@@ -482,12 +825,12 @@ export async function importLegacy(backup) {
       Array.isArray(g.opponents) &&
       g.opponents.length > 0 &&
       g.opponents.every((o) => o && typeof o.name === 'string' && o.name.trim() && Number.isFinite(o.score));
-    const existing = valid ? data.games.get(g.id) : null;
-    if (!valid || (existing && !canEdit(existing))) {
+    const existing = valid ? games.get(g.id) : null;
+    if (!valid || (existing && !canEdit({ ...existing, group: gid }))) {
       ignored += 1;
       continue;
     }
-    const players = [{ pid: myPid(), score: g.me }, ...g.opponents.map((o) => ({ pid: ensurePlayer(o.name, ops), score: o.score }))];
+    const players = [{ pid: myPid(gid), score: g.me }, ...g.opponents.map((o) => ({ pid: ensurePlayer(gid, o.name, ops), score: o.score }))];
     const game = {
       date: g.date,
       sport: sportIds.get(g.sport),
@@ -496,11 +839,11 @@ export async function importLegacy(backup) {
       players,
       pids: players.map((p) => p.pid),
       createdBy: existing?.createdBy || session.uid,
-      createdByName: existing?.createdByName || getMe(),
+      createdByName: existing?.createdByName || getMe(gid),
       createdAt: g.createdAt || now,
       updatedAt: g.updatedAt || now,
     };
-    ops.push({ type: 'set', col: 'games', id: g.id, data: game });
+    ops.push({ type: 'set', col: gamesPath(gid), id: g.id, data: game });
     if (existing) updated += 1;
     else added += 1;
   }
@@ -509,7 +852,7 @@ export async function importLegacy(backup) {
 }
 
 // ---------------------------------------------------------------------------
-// Propre a ce telephone : brouillon de saisie et joueurs du jour
+// Propre a ce telephone : brouillon de saisie, joueurs du jour, dernier groupe utilise
 // ---------------------------------------------------------------------------
 
 export function getDraft() {
@@ -529,6 +872,9 @@ export function addDayPlayer(date, name) {
   const players = getDayPlayers(date);
   if (name && !players.includes(name)) writeLocal(LOCAL.day, { date, players: [...players, name] });
 }
+
+export const getPref = (key, fallback = null) => read(`sl.pref.${key}`, fallback);
+export const setPref = (key, value) => writeLocal(`sl.pref.${key}`, value);
 
 export async function requestPersistence() {
   try {

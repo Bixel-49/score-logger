@@ -1,71 +1,76 @@
 # Score Logger — version partagée
 
-Application web installable (PWA) pour garder les scores de tous nos sports et jeux, du squash aux jeux de société, depuis un téléphone Android. Les parties sont **partagées par un groupe** : chacun se connecte avec son compte Google et saisit les parties qui le concernent. Les données sont stockées en ligne dans Firebase (Google). L'application fonctionne aussi hors connexion et envoie les parties dès que le réseau revient.
+Application web installable (PWA) pour garder les scores de tous nos sports et jeux, du squash aux jeux de société, depuis un téléphone Android. Les parties sont rangées dans des **groupes** (ex. « Squash boulot », « Famille ») : chacun se connecte avec son compte Google et saisit les parties qui le concernent. Les données sont stockées en ligne dans Firebase (Google). L'application fonctionne aussi hors connexion et envoie les parties dès que le réseau revient.
 
 ## Principe
 
-- **Groupe** : une seule base commune. On la rejoint en se connectant avec Google puis en saisissant le **code du groupe**.
-- **Joueur** : chaque compte est relié à un joueur. Si d'autres membres ont déjà saisi des parties contre toi, choisis ton nom à la première connexion : ces parties deviennent les tiennes.
-- **Sport ou jeu** : nom, icône et règle de victoire. Par défaut, le plus grand score gagne. On peut cocher « le plus petit score gagne » pour le golf ou certains jeux de cartes. Les sports sont communs à tout le groupe.
-- **Partie** : moi contre un ou plusieurs adversaires, avec un score numérique pour chacun (décimales et négatifs acceptés). Elle apparaît aussi chez chacun des adversaires, de leur point de vue.
+- **Groupe** : des joueurs et leurs parties. Chaque groupe a son **code**. On le rejoint en se connectant avec Google puis en saisissant ce code, ou sans code si un administrateur nous y a invité. On peut faire partie de plusieurs groupes. Un membre ne voit que les groupes dont il fait partie.
+- **Joueur** : dans chaque groupe, ton compte est relié à un joueur. Si d'autres membres ont déjà saisi des parties contre toi, choisis ton nom : ces parties deviennent les tiennes.
+- **Sport ou jeu** : nom, icône et règle de victoire. Par défaut, le plus grand score gagne. On peut cocher « le plus petit score gagne » pour le golf ou certains jeux de cartes. Les sports sont communs à tous les groupes.
+- **Partie** : moi contre un ou plusieurs adversaires du même groupe, avec un score numérique pour chacun (décimales et négatifs acceptés). Elle apparaît aussi chez chacun des adversaires, de leur point de vue.
 - **Résultat** calculé automatiquement :
   - **victoire** si je suis seul en tête ;
   - **nul** si je suis à égalité en tête ;
   - **défaite** sinon.
 
   Dans une partie à plusieurs, ma place est aussi calculée (ex. 2e/4).
-- **Droits** : tout le groupe voit toutes les parties. Seuls l'auteur d'une partie, ses joueurs et les administrateurs peuvent la modifier ou la supprimer. Un joueur relié à un compte ne peut être renommé que par ce compte ou un administrateur.
+- **Stats sur plusieurs groupes** : les joueurs reliés au même compte Google sont réunis. Tes stats « Tous mes groupes » additionnent donc tes parties de chaque groupe.
+- **Droits** : les membres d'un groupe voient toutes ses parties. Seuls l'auteur d'une partie, ses joueurs, le responsable du groupe et les administrateurs peuvent la modifier ou la supprimer. Un joueur relié à un compte ne peut être renommé que par ce compte, le responsable ou un administrateur.
 
-## Administration
+## Responsables et administrateurs
 
-Les administrateurs sont les e-mails listés dans le champ `admins` du document `config/group` (voir la mise en place). Ils ont une carte **🔑 Administration** dans les Réglages, et le serveur leur accorde des droits supplémentaires :
+**Créer un groupe** : tout membre d'au moins un groupe peut créer un groupe (**Réglages → Mon compte → ✨ Créer un groupe**). Il en devient le **responsable** (🔑). Quelqu'un qui n'a encore aucun groupe ne peut pas en créer : il doit d'abord en rejoindre un.
 
-- **Modifier ou supprimer n'importe quelle partie**, même sans y avoir joué. La partie s'ouvre alors du point de vue de son premier joueur.
-- **Renommer n'importe quel joueur**, même relié à un compte.
-- **Révoquer l'accès d'un membre** (🚫). Il ne peut plus rien voir ni saisir, même avec le code du groupe. Ses parties restent dans l'historique. ↩️ rétablit l'accès.
-- **Changer le joueur d'un membre** (👤). L'ancien joueur redevient libre.
-- **Attribuer un joueur à un e-mail** : la personne entre sans code et est directement reliée à ce joueur. Personne d'autre ne peut revendiquer ce joueur. Si l'adresse est déjà celle d'un membre, il est relié tout de suite.
-- **Changer le code du groupe.**
+**Le responsable** gère son groupe, et seulement le sien, dans **Réglages → carte Groupe → 🔑 Gestion du groupe** :
+
+- renommer le groupe, changer son code ;
+- **Membres** : changer le joueur d'un membre (👤), le retirer du groupe (✕) ; il ne pourra pas y revenir avec le code ; ↩️ le remet ;
+- **Inviter par e-mail** : la personne entre sans code et est directement reliée au joueur choisi ; personne d'autre ne peut revendiquer ce joueur ; si l'adresse est déjà celle d'un membre du groupe, il est relié tout de suite ;
+- **modifier ou supprimer n'importe quelle partie** du groupe, **renommer n'importe quel joueur** du groupe ;
+- **saisir une partie sans y jouer** : dans l'onglet Partie, toucher la case « Moi » pour choisir un autre joueur principal. Il peut aussi gérer le groupe sans y avoir de joueur (« Je ne joue pas dans ce groupe »).
+
+**Les administrateurs** (e-mails listés dans le champ `admins` du document `config/group`, voir la mise en place) ont les droits d'un responsable sur **tous les groupes**, et voient tous les groupes. Leur carte **🛡️ Administration** liste tous les comptes et permet de **révoquer** (🚫) l'accès d'un compte à tous les groupes ; ↩️ le rétablit. Les parties restent dans l'historique.
+
+**Les membres** voient les parties de leurs groupes et ne modifient que celles où ils jouent ou qu'ils ont saisies.
+
+Pour des parties avec des gens extérieurs, que les autres ne doivent pas voir : crée un groupe (ex. « Perso ») dont tu es le seul membre.
 
 ## Onglets
 
-- **Partie** : saisie de toutes les parties d'une journée en une fois. Chaque partie a son sport, mon score, puis chaque adversaire avec son score à droite.
+- **Partie** : saisie de toutes les parties d'une journée en une fois, dans le groupe choisi en haut (si tu en as plusieurs). Chaque partie a son sport, mon score, puis chaque adversaire avec son score à droite.
   - **Joueurs du jour** : toucher un joueur l'ajoute comme adversaire de la partie sélectionnée (encadrée) ; le retoucher le retire.
   - **➕ Ajouter une partie** ajoute une nouvelle partie, avec le même sport que la précédente.
   - **💾 Enregistrer les N parties** enregistre tout d'un coup.
-- **Historique** : **Mes parties** (avec le bilan de chaque jour) ou **Tout le groupe** (avec le vainqueur des parties auxquelles je n'ai pas joué). Recherche, filtre par sport, détail, modification, suppression.
-- **Stats** : mes stats, ou celles de n'importe quel joueur du groupe. Tous sports confondus ou par sport, sur tout, cette année ou les 30 derniers jours.
+- **Historique** : **Mes parties** (avec le bilan de chaque jour) ou **Toutes les parties** (avec le vainqueur des parties auxquelles je n'ai pas joué), pour un groupe ou tous mes groupes. Recherche, filtre par sport, détail, modification, suppression.
+- **Stats** : pour un groupe ou tous mes groupes, mes stats ou celles de n'importe quel joueur. Tous sports confondus ou par sport, sur tout, cette année ou les 30 derniers jours.
   - Parties, victoires, défaites, nuls, % de victoires, forme sur les 10 dernières parties, série en cours.
   - **Par sport**, **Scores**, **Faits marquants** (victime préférée, bête noire…), **Face-à-face**, **Selon le nombre de joueurs**.
-- **Réglages** : mon compte et mon nom de joueur, **Inviter quelqu'un** (envoie le lien et le code du groupe), sports et jeux, joueurs (renommer ; un nom existant fusionne les deux), export JSON du groupe, import des parties de l'ancienne version.
+- **Réglages** : mes groupes (mon nom dans chacun, 📤 inviter quelqu'un avec le lien et le code, ➕ rejoindre un groupe, ✨ créer un groupe), carte Groupe (gestion pour le responsable, joueurs : renommer ; un nom existant fusionne les deux), sports et jeux, export JSON, import des parties de l'ancienne version.
 
 ## Mise en place de Firebase (une seule fois, environ 10 minutes)
 
-Firebase est gratuit pour un groupe d'amis (offre Spark : 50 000 lectures et 20 000 écritures par jour).
+Firebase est gratuit pour des groupes d'amis (offre Spark : 50 000 lectures et 20 000 écritures par jour).
 
 1. Va sur <https://console.firebase.google.com>, clique sur **Créer un projet**, donne-lui un nom (ex. `score-logger`). Google Analytics n'est pas nécessaire.
 2. **Connexion Google** : menu **Créer → Authentication → Commencer**, onglet **Sign-in method**, choisis **Google**, active-le, choisis ton e-mail d'assistance, puis **Enregistrer**.
    Onglet **Paramètres → Domaines autorisés** : ajoute `<ton-pseudo>.github.io`. `localhost` y est déjà, pour les tests sur le PC.
 3. **Base de données** : menu **Créer → Firestore Database → Créer une base de données**. Choisis un emplacement en Europe (ex. `europe-west1`) et le **mode production**.
 4. **Règles de sécurité** : dans Firestore, onglet **Règles**, remplace tout par le contenu du fichier [`firestore.rules`](firestore.rules), puis **Publier**.
-5. **Code du groupe** : dans Firestore, onglet **Données**, clique sur **Commencer une collection** :
+5. **Administrateurs** : dans Firestore, onglet **Données**, clique sur **Commencer une collection** :
    - ID de la collection : `config` ;
    - ID du document : `group` ;
-   - un champ `code`, de type `string`, avec le code secret de ton choix (ex. `squash-du-jeudi-42`) ;
    - un champ `admins`, de type `array`, contenant une valeur `string` : ton adresse Gmail **en minuscules**. Ajoute d'autres adresses pour avoir plusieurs administrateurs.
-
-   Ensuite, le code peut être changé depuis l'application (**Réglages → Administration**). Les membres déjà inscrits restent membres.
-6. **Configuration de l'application** : ⚙️ **Paramètres du projet**, section **Vos applications**, clique sur l'icône **Web** `</>`, donne un nom (pas besoin de Firebase Hosting). Copie les valeurs de `firebaseConfig` dans [`js/firebase-config.js`](js/firebase-config.js). Ces valeurs ne sont pas secrètes : c'est le code du groupe et les règles qui protègent les données.
+6. **Configuration de l'application** : ⚙️ **Paramètres du projet**, section **Vos applications**, clique sur l'icône **Web** `</>`, donne un nom (pas besoin de Firebase Hosting). Copie les valeurs de `firebaseConfig` dans [`js/firebase-config.js`](js/firebase-config.js). Ces valeurs ne sont pas secrètes : ce sont les codes des groupes et les règles qui protègent les données.
 7. `git commit` puis `git push` (voir plus bas).
 
 ## Première connexion
 
 1. Ouvre l'application et touche **Se connecter avec Google**.
-2. Saisis le code du groupe. Les administrateurs et les personnes invitées par e-mail passent cette étape.
-3. Choisis ton nom dans la liste des joueurs existants, ou crée ton joueur. Si un administrateur t'a attribué un joueur, tu y es relié automatiquement.
-4. Si des parties de l'ancienne version sont encore sur le téléphone, l'application propose de les **envoyer au groupe**. Dans ces parties, « Moi » devient ton joueur, et les adversaires sont rapprochés par leur nom des joueurs existants. On peut aussi le faire plus tard dans **Réglages → Sauvegarde**, ou importer un fichier `scores-AAAA-MM-JJ.json` exporté par l'ancienne version.
+2. **Administrateur** : l'application te fait créer ton premier groupe (nom et code). **Membre** : saisis le code du groupe ; les personnes invitées par e-mail passent cette étape.
+3. Dans chaque groupe, choisis ton nom dans la liste des joueurs existants, ou crée ton joueur. Si un administrateur t'a attribué un joueur, tu y es relié automatiquement.
+4. Si des parties de l'ancienne version sont encore sur le téléphone, l'application propose de les **envoyer dans un groupe**. Dans ces parties, « Moi » devient ton joueur, et les adversaires sont rapprochés par leur nom des joueurs existants. On peut aussi le faire plus tard dans **Réglages → Sauvegarde** (le groupe est celui choisi dans la carte Joueurs), ou importer un fichier `scores-AAAA-MM-JJ.json` exporté par l'ancienne version.
 
-Pour inviter quelqu'un : **Réglages → Inviter quelqu'un**, qui envoie le lien et le code par WhatsApp, SMS, etc.
+Pour inviter quelqu'un : **Réglages → Mes groupes → 📤**, qui envoie le lien et le code du groupe par WhatsApp, SMS, etc.
 
 ## Mise en ligne sur GitHub Pages (gratuit)
 
@@ -107,7 +112,7 @@ Ouvre ensuite <http://localhost:8000>. Dans Chrome, F12 puis le mode appareil mo
 ## Organisation du code
 
 - `js/cloud.js` : connexion Google et accès à Firestore.
-- `js/store.js` : données du groupe (sports, joueurs, parties), vues du point de vue d'un joueur, import de l'ancienne version.
+- `js/store.js` : données (groupes, sports, joueurs, parties), vues du point de vue d'un joueur, administration, import de l'ancienne version.
 - `js/stats.js` : calcul des résultats et des statistiques.
 - `js/app.js` : interface.
 - `firestore.rules` : règles de sécurité (qui peut lire et modifier quoi).

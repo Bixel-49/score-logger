@@ -4,15 +4,17 @@ rules_version = '2';
 // Firestore Database > Regles > coller ce fichier > Publier.
 //
 // Document config/group (cree a la main dans la console) :
-//   code   : code du groupe, pour entrer sans invitation
-//   admins : liste des e-mails administrateurs
+//   admins : liste des e-mails administrateurs (en minuscules)
 //
-// - Seuls les membres non revoques lisent et ecrivent.
-// - On devient membre avec le code du groupe, ou sans code si un administrateur
-//   a cree une invitation pour son e-mail (invites/{e-mail}).
-// - Une partie ne peut etre modifiee ou supprimee que par son auteur, ses joueurs ou un administrateur.
-// - Un joueur relie a un compte ne peut etre renomme que par ce compte ou un administrateur.
+// - Chaque groupe (groups/{gid}) a ses joueurs et ses parties, lisibles seulement par ses membres et les administrateurs.
+// - Tout membre d'au moins un groupe peut creer un groupe : il en devient le responsable (champ owner).
+//   Le responsable gere son groupe (nom, code, membres, invitations, joueurs, parties) ; l'administrateur gere tout.
+// - On entre dans un groupe avec son code (joinCodes/{code}), avec une invitation a son e-mail (invites/{e-mail}),
+//   en le creant, ou en etant administrateur. Un membre retire d'un groupe ne peut pas y revenir avec le code.
+// - Une partie ne peut etre modifiee ou supprimee que par son auteur, ses joueurs, le responsable du groupe ou un administrateur.
+// - Un joueur relie a un compte ne peut etre renomme que par ce compte, le responsable ou un administrateur.
 // - Un joueur attribue a un e-mail ne peut etre revendique que par ce compte.
+// - Un membre revoque (par un administrateur) ne peut plus rien lire ni ecrire.
 service cloud.firestore {
   match /databases/{database}/documents {
     function signedIn() {
@@ -21,88 +23,159 @@ service cloud.firestore {
     function myEmail() {
       return request.auth.token.email;
     }
-    function cfg() {
-      return get(/databases/$(database)/documents/config/group).data;
-    }
     function isAdmin() {
       return signedIn() && request.auth.token.email_verified == true
-        && myEmail() in cfg().get('admins', []);
+        && myEmail() in get(/databases/$(database)/documents/config/group).data.get('admins', []);
     }
     function memberPath() {
       return /databases/$(database)/documents/members/$(request.auth.uid);
     }
+    function me() {
+      return get(memberPath()).data;
+    }
     function isMember() {
-      return signedIn() && exists(memberPath()) && get(memberPath()).data.get('revoked', false) != true;
+      return signedIn() && exists(memberPath()) && me().get('revoked', false) != true;
     }
-    function myPid() {
-      return get(memberPath()).data.pid;
+    function inGroup(gid) {
+      return isAdmin() || (isMember() && gid in me().get('groups', []));
     }
-    function invited() {
-      return signedIn() && exists(/databases/$(database)/documents/invites/$(myEmail()));
+    // Responsable du groupe (etat apres l'ecriture : fonctionne aussi pendant la creation du groupe)
+    function isOwner(gid) {
+      return isMember() && getAfter(/databases/$(database)/documents/groups/$(gid)).data.get('owner', null) == request.auth.uid;
     }
-    function participant(game) {
-      return myPid() != null && myPid() in game.pids;
+    function canManage(gid) {
+      return isAdmin() || isOwner(gid);
+    }
+    function myPid(gid) {
+      return me().get('pids', {}).get(gid, null);
+    }
+    function participant(gid, game) {
+      return isMember() && myPid(gid) != null && myPid(gid) in game.pids;
+    }
+    // Difference symetrique de deux listes, sous forme d'ensemble
+    function changedItems(a, b) {
+      return a.toSet().difference(b.toSet()).union(b.toSet().difference(a.toSet()));
+    }
+
+    // Rejoindre un groupe : un seul a la fois (champ "joining"), avec son code, une invitation,
+    // en etant son responsable (creation) ou administrateur
+    function joinOk(d, oldGroups, removed) {
+      let added = d.get('groups', []).toSet().difference(oldGroups.toSet());
+      return added.size() == 0
+        || (added == [d.joining].toSet() && !(d.joining in removed)
+          && (isAdmin()
+            || getAfter(/databases/$(database)/documents/groups/$(d.joining)).data.get('owner', null) == request.auth.uid
+            || getAfter(/databases/$(database)/documents/joinCodes/$(d.joinCode)).data.group == d.joining
+            || d.joining in get(/databases/$(database)/documents/invites/$(myEmail())).data.groups));
+    }
+
+    // Se relier a son joueur dans un groupe (champ "linking") : le joueur doit m'etre attribue dans la meme ecriture
+    function linkOk(d, oldPids) {
+      let changed = d.get('pids', {}).diff(oldPids).affectedKeys();
+      return changed.size() == 0
+        || (changed.hasOnly([d.linking]) && d.linking in d.get('groups', [])
+          && getAfter(/databases/$(database)/documents/groups/$(d.linking)/players/$(d.pids[d.linking])).data.uid == request.auth.uid);
+    }
+
+    // Le responsable d'un groupe modifie un membre, pour ce groupe seulement (champ "managing")
+    function manageOk(d, old) {
+      let gid = d.managing;
+      return isOwner(gid)
+        && d.diff(old).affectedKeys().hasOnly(['groups', 'pids', 'removed', 'managing'])
+        && changedItems(d.get('groups', []), old.get('groups', [])).hasOnly([gid])
+        && changedItems(d.get('removed', []), old.get('removed', [])).hasOnly([gid])
+        && d.get('pids', {}).diff(old.get('pids', {})).affectedKeys().hasOnly([gid]);
     }
 
     match /config/{doc} {
-      allow read: if isMember() || isAdmin();
+      allow read: if signedIn();
       allow write: if isAdmin();
     }
 
-    // Invitation : e-mail -> joueur attribue
+    // Code d'entree -> groupe. On ne peut lire un code qu'en le connaissant. Un code deja pris ne peut pas etre detourne.
+    match /joinCodes/{code} {
+      allow get: if signedIn();
+      allow list: if isAdmin();
+      allow create: if canManage(request.resource.data.group);
+      allow update: if canManage(resource.data.group) && canManage(request.resource.data.group);
+      allow delete: if canManage(resource.data.group);
+    }
+
+    // Invitation : e-mail -> { groups: { gid: joueur } } ; un responsable ne touche qu'a son groupe (champ "managing")
     match /invites/{email} {
-      allow read: if isMember() || isAdmin() || (signedIn() && email == myEmail());
-      allow write: if isAdmin();
+      allow read: if isAdmin() || (signedIn() && email == myEmail());
+      allow create: if isAdmin() || (canManage(request.resource.data.managing)
+        && request.resource.data.groups.keys().hasOnly([request.resource.data.managing]));
+      allow update: if isAdmin() || (canManage(request.resource.data.managing)
+        && request.resource.data.get('groups', {}).diff(resource.data.get('groups', {})).affectedKeys().hasOnly([request.resource.data.managing]));
+      allow delete: if isAdmin();
     }
 
     match /members/{uid} {
-      allow read: if isMember() || isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == uid);
       allow create: if signedIn() && request.auth.uid == uid
-        && request.resource.data.pid == null
         && request.resource.data.get('revoked', false) == false
-        && ((request.resource.data.code != '' && request.resource.data.code == cfg().code) || invited() || isAdmin());
-      // Un membre ne change que son joueur, et seulement vers un joueur qui lui est attribue dans la meme ecriture.
-      // L'administrateur peut tout modifier (revoquer, changer le joueur d'un membre).
-      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
-        && resource.data.get('revoked', false) != true
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pid'])
-        && (request.resource.data.pid == null
-          || getAfter(/databases/$(database)/documents/players/$(request.resource.data.pid)).data.uid == uid));
+        && request.resource.data.get('removed', []) == []
+        && joinOk(request.resource.data, [], [])
+        && linkOk(request.resource.data, {});
+      allow update: if isAdmin()
+        || (signedIn() && request.auth.uid == uid
+          && resource.data.get('revoked', false) != true
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['groups', 'pids', 'joining', 'joinCode', 'linking'])
+          && joinOk(request.resource.data, resource.data.get('groups', []), resource.data.get('removed', []))
+          && linkOk(request.resource.data, resource.data.get('pids', {})))
+        || (signedIn() && request.auth.uid != uid && manageOk(request.resource.data, resource.data));
       allow delete: if isAdmin();
     }
 
     match /sports/{id} {
-      allow read: if isMember();
-      allow create, update: if isMember() && request.resource.data.name is string;
-      allow delete: if isMember();
+      allow read: if isAdmin() || isMember();
+      allow create, update: if (isAdmin() || isMember()) && request.resource.data.name is string;
+      allow delete: if isAdmin() || isMember();
     }
 
-    match /players/{id} {
-      allow read: if isMember();
-      allow create: if isAdmin() || (isMember() && request.resource.data.name is string
-        && request.resource.data.uid in [null, request.auth.uid]
-        && request.resource.data.get('email', null) == null);
-      allow update: if isAdmin() || (isMember()
-        && request.resource.data.uid in [null, request.auth.uid]
-        && (resource.data.uid == null || resource.data.uid == request.auth.uid)
-        && request.resource.data.get('email', null) == resource.data.get('email', null)
-        // revendiquer un joueur attribue a un autre e-mail est interdit
-        && (resource.data.uid == request.auth.uid || request.resource.data.uid == null
-          || resource.data.get('email', null) in [null, myEmail()]));
-      allow delete: if isAdmin() || (isMember() && resource.data.uid == null);
-    }
+    match /groups/{gid} {
+      allow read: if inGroup(gid);
+      // Creer un groupe : etre membre d'au moins un groupe (ou administrateur), et en etre le responsable
+      allow create: if request.resource.data.name is string
+        && request.resource.data.owner == request.auth.uid
+        && (isAdmin() || (isMember() && me().get('groups', []).size() > 0));
+      allow update: if (canManage(gid) && (isAdmin() || request.resource.data.owner == resource.data.owner))
+        // un membre s'inscrit lui-meme dans la liste des membres en rejoignant le groupe
+        || (signedIn()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['roster'])
+          && request.resource.data.roster.diff(resource.data.get('roster', {})).affectedKeys().hasOnly([request.auth.uid])
+          && request.resource.data.roster[request.auth.uid].get('removed', false) == false
+          && gid in getAfter(memberPath()).data.get('groups', []));
+      allow delete: if isAdmin();
 
-    match /games/{id} {
-      allow read: if isMember();
-      allow create: if isMember()
-        && request.resource.data.createdBy == request.auth.uid
-        && request.resource.data.pids is list
-        && (participant(request.resource.data) || isAdmin());
-      allow update: if (isAdmin() || (isMember() && (resource.data.createdBy == request.auth.uid || participant(resource.data))))
-        && request.resource.data.createdBy == resource.data.createdBy
-        && request.resource.data.pids is list;
-      allow delete: if isAdmin()
-        || (isMember() && (resource.data.createdBy == request.auth.uid || participant(resource.data)));
+      match /players/{pid} {
+        allow read: if inGroup(gid);
+        allow create: if canManage(gid) || (inGroup(gid) && request.resource.data.name is string
+          && request.resource.data.uid in [null, request.auth.uid]
+          && request.resource.data.get('email', null) == null);
+        allow update: if canManage(gid) || (inGroup(gid)
+          && request.resource.data.uid in [null, request.auth.uid]
+          && (resource.data.uid == null || resource.data.uid == request.auth.uid)
+          && request.resource.data.get('email', null) == resource.data.get('email', null)
+          // revendiquer un joueur attribue a un autre e-mail est interdit
+          && (resource.data.uid == request.auth.uid || request.resource.data.uid == null
+            || resource.data.get('email', null) in [null, myEmail()]));
+        allow delete: if canManage(gid) || (inGroup(gid) && resource.data.uid == null);
+      }
+
+      match /games/{id} {
+        allow read: if inGroup(gid);
+        allow create: if inGroup(gid)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.resource.data.pids is list
+          && (canManage(gid) || participant(gid, request.resource.data));
+        allow update: if (canManage(gid) || (inGroup(gid) && (resource.data.createdBy == request.auth.uid || participant(gid, resource.data))))
+          && request.resource.data.createdBy == resource.data.createdBy
+          && request.resource.data.pids is list;
+        allow delete: if canManage(gid)
+          || (inGroup(gid) && (resource.data.createdBy == request.auth.uid || participant(gid, resource.data)));
+      }
     }
   }
 }

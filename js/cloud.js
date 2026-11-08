@@ -64,7 +64,7 @@ export function watchDoc(col, id, callback, onError) {
       if (snap.exists()) callback({ id: snap.id, ...snap.data() });
       else if (!snap.metadata.fromCache) callback(null);
     },
-    onError,
+    (e) => onError?.(Object.assign(e, { context: `lecture ${col}/${id}` })),
   );
 }
 
@@ -83,19 +83,37 @@ export function watchCollection(col, callback, onError) {
   return fb.f.onSnapshot(
     fb.f.collection(fb.db, col),
     (snap) => callback(snap.docs.map((d) => ({ id: d.id, ...d.data() }))),
-    onError,
+    (e) => onError?.(Object.assign(e, { context: `lecture ${col}` })),
   );
 }
 
-// ops : [{ type: 'set' | 'update' | 'delete', col, id, data }]
+// Operations ciblees sur un champ, sans connaitre le reste du document :
+// { __t: 'union', v: [...] } ajoute a une liste, { __t: 'remove', v: [...] } retire d'une liste, { __t: 'del' } supprime le champ.
+function transform(data) {
+  const out = {};
+  for (const [key, value] of Object.entries(data)) {
+    if (value && value.__t === 'union') out[key] = fb.f.arrayUnion(...value.v);
+    else if (value && value.__t === 'remove') out[key] = fb.f.arrayRemove(...value.v);
+    else if (value && value.__t === 'del') out[key] = fb.f.deleteField();
+    else out[key] = value;
+  }
+  return out;
+}
+
+// ops : [{ type: 'set' | 'merge' | 'update' | 'delete', col, id, data }]
+// En 'update', une cle "a.b" designe le champ b de l'objet a.
 // La promesse se resout quand le serveur a confirme (jamais hors connexion) :
 // l'appelant ne l'attend que si c'est necessaire. Les donnees locales sont mises a jour tout de suite.
 export function write(ops) {
   const batch = fb.f.writeBatch(fb.db);
   for (const op of ops) {
-    if (op.type === 'set') batch.set(ref(op.col, op.id), op.data);
-    else if (op.type === 'update') batch.update(ref(op.col, op.id), op.data);
+    if (op.type === 'set') batch.set(ref(op.col, op.id), transform(op.data));
+    else if (op.type === 'merge') batch.set(ref(op.col, op.id), transform(op.data), { merge: true });
+    else if (op.type === 'update') batch.update(ref(op.col, op.id), transform(op.data));
     else batch.delete(ref(op.col, op.id));
   }
-  return batch.commit();
+  // En cas de refus, on note les ecritures concernees (affichees dans la console pour comprendre)
+  return batch.commit().catch((e) => {
+    throw Object.assign(e, { context: `écriture ${ops.map((op) => `${op.col}/${op.id}`).join(', ')}` });
+  });
 }
