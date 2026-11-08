@@ -207,7 +207,15 @@ const state = {
   sport: '',
   historyQuery: '',
   historySport: '',
-  historyScope: 'mine', // 'mine' : mes parties ; 'all' : tout le groupe
+  // 'mine' : mes parties ; 'all' : tout le groupe. Dernier choix retenu sur ce telephone ;
+  // a defaut, tout le groupe pour un administrateur.
+  historyScope: (() => {
+    try {
+      return localStorage.getItem('sl.historyScope');
+    } catch {
+      return null;
+    }
+  })(),
   statsPid: '', // joueur dont on regarde les stats ('' = moi)
 };
 
@@ -968,7 +976,8 @@ function sportFilter(value, onchange) {
 
 function renderHistoryView() {
   const sports = sportsMap();
-  const group = state.historyScope === 'all';
+  const scope = state.historyScope || (store.isAdmin() ? 'all' : 'mine');
+  const group = scope === 'all';
   const all = group ? store.getAllGames() : store.getGames();
   const q = normalize(state.historyQuery);
   const filtered = all.filter(
@@ -1023,9 +1032,14 @@ function renderHistoryView() {
         ['mine', 'Mes parties'],
         ['all', 'Tout le groupe'],
       ],
-      state.historyScope,
+      scope,
       (k) => {
         state.historyScope = k;
+        try {
+          localStorage.setItem('sl.historyScope', k);
+        } catch {
+          // non critique
+        }
         rerenderKeepScroll();
       },
     ),
