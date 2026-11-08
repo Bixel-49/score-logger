@@ -659,7 +659,8 @@ export function setRevoked(memberUid, revoked) {
 }
 
 // ---------------------------------------------------------------------------
-// Sports et jeux : { id, name, icon, lowerWins } ; communs a tous les groupes
+// Sports et jeux : { id, name, icon, lowerWins, titled } ; communs a tous les groupes
+// titled : demander le nom du jeu a chaque partie (jeux de societe)
 // ---------------------------------------------------------------------------
 
 export function getSports() {
@@ -667,7 +668,7 @@ export function getSports() {
 }
 
 export function saveSport(sport) {
-  const saved = { id: sport.id || uid(), name: sport.name.trim(), icon: (sport.icon || '').trim() || '🏅', lowerWins: Boolean(sport.lowerWins) };
+  const saved = { id: sport.id || uid(), name: sport.name.trim(), icon: (sport.icon || '').trim() || '🏅', lowerWins: Boolean(sport.lowerWins), titled: Boolean(sport.titled) };
   const { id, ...fields } = saved;
   commit([{ type: 'set', col: 'sports', id, data: fields }]);
   return saved;
@@ -687,15 +688,31 @@ function view(gid, g) {
   return {
     ...g,
     group: gid,
-    players: (g.players || []).map((p) => ({ pid: resolve(gid, p.pid), key: keyOf(gid, p.pid), name: nameOf(gid, p.pid), score: p.score })),
+    players: (g.players || []).map((p) => ({ pid: resolve(gid, p.pid), key: keyOf(gid, p.pid), name: nameOf(gid, p.pid), score: p.score, team: p.team ?? null })),
   };
 }
 
-// Partie vue par un joueur (par sa cle), ou null s'il n'y a pas participe
+// Partie vue par un joueur (par sa cle), ou null s'il n'y a pas participe.
+// Voir stats.js pour le format : me, opponents (avec team en mode equipes), teammates.
 export function perspective(g, key) {
   const me = g.players.find((p) => p.key === key);
   if (!me) return null;
-  return { ...g, me: me.score, opponents: g.players.filter((p) => p !== me).map(({ name, score }) => ({ name, score })) };
+  const others = g.players.filter((p) => p !== me);
+  if (g.mode === 'coop') {
+    return { ...g, me: Number.isFinite(me.score) ? me.score : null, teammates: others.map((p) => p.name), opponents: [] };
+  }
+  if (g.mode === 'teams') {
+    // Mon equipe porte le numero 0, les equipes adverses 1, 2... dans l'ordre d'apparition
+    const numbers = new Map();
+    for (const p of others) if (p.team !== me.team && !numbers.has(p.team)) numbers.set(p.team, numbers.size + 1);
+    return {
+      ...g,
+      me: me.score,
+      teammates: others.filter((p) => p.team === me.team).map((p) => p.name),
+      opponents: others.filter((p) => p.team !== me.team).map((p) => ({ name: p.name, score: p.score, team: numbers.get(p.team) })),
+    };
+  }
+  return { ...g, me: me.score, teammates: [], opponents: others.map(({ name, score }) => ({ name, score })) };
 }
 
 // Toutes les parties visibles ; groupId : un seul groupe, ou '' pour tous
@@ -728,15 +745,23 @@ export function canEdit(g) {
   return canManage(g.group) || g.createdBy === session.uid || (g.pids || []).includes(myPid(g.group));
 }
 
-// record : { id, group, createdAt, date, location, sport, me, opponents: [{ name, score }], comments, owner }
-// owner : joueur dont "me" est le score (moi par defaut ; un administrateur peut saisir pour un autre)
+// record : partie "vue par un joueur" (voir stats.js) + { id, group, createdAt, owner }
+//   mode, me, opponents: [{ name, score, team }], teammates: [nom], result, title, location, comments
+// owner : joueur dont "me" est le score (moi par defaut ; le responsable ou un administrateur peut saisir pour un autre)
 export function saveGame(record) {
   const gid = record.group;
   if (!gid) throw new Error('Choisis le groupe.');
   const ops = [];
   const ownerPid = record.owner ? ensurePlayer(gid, record.owner, ops) : myPid(gid);
   if (!ownerPid) throw new Error(`Choisis d’abord ton joueur dans « ${groupName(gid)} », ou saisis la partie pour un autre joueur.`);
-  const players = [{ pid: ownerPid, score: record.me }, ...record.opponents.map((o) => ({ pid: ensurePlayer(gid, o.name, ops), score: o.score }))];
+  const mode = record.mode === 'teams' || record.mode === 'coop' ? record.mode : null;
+  const myScore = Number.isFinite(record.me) ? record.me : null;
+  // Mon camp (moi + coequipiers) : equipe 0 avec le score de l'equipe ; adversaires : leur equipe en mode equipes
+  const players = [
+    { pid: ownerPid, score: myScore, ...(mode ? { team: 0 } : {}) },
+    ...(mode ? record.teammates || [] : []).map((name) => ({ pid: ensurePlayer(gid, name, ops), score: myScore, team: 0 })),
+    ...(mode === 'coop' ? [] : record.opponents).map((o) => ({ pid: ensurePlayer(gid, o.name, ops), score: o.score, ...(mode === 'teams' ? { team: o.team } : {}) })),
+  ];
   // Partie deplacee vers un autre groupe : on la retire de l'ancien
   const fromGroup = record.id ? [...data.games.keys()].find((g) => data.games.get(g).has(record.id)) : null;
   const previous = fromGroup ? data.games.get(fromGroup).get(record.id) : null;
@@ -746,6 +771,9 @@ export function saveGame(record) {
   const game = {
     date: record.date,
     sport: record.sport,
+    title: (record.title || '').trim(),
+    mode,
+    result: mode === 'coop' ? record.result : null,
     location: record.location || '',
     comments: record.comments || '',
     players,
@@ -758,6 +786,16 @@ export function saveGame(record) {
   ops.push({ type: 'set', col: gamesPath(gid), id, data: game });
   commit(ops);
   return view(gid, { id, ...game });
+}
+
+// Noms de jeux deja saisis pour un sport (suggestions), les plus joues d'abord
+export function getTitles(sportId) {
+  const count = new Map();
+  for (const g of getAllGames()) {
+    const t = (g.title || '').trim();
+    if (g.sport === sportId && t) count.set(t, (count.get(t) || 0) + 1);
+  }
+  return [...count.entries()].sort((a, b) => b[1] - a[1] || byName(a[0], b[0])).map(([t]) => t);
 }
 
 export function deleteGame(gid, id) {

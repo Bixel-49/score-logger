@@ -6,14 +6,17 @@ Application web installable (PWA) pour garder les scores de tous nos sports et j
 
 - **Groupe** : des joueurs et leurs parties. Chaque groupe a son **code**. On le rejoint en se connectant avec Google puis en saisissant ce code, ou sans code si un administrateur nous y a invité. On peut faire partie de plusieurs groupes. Un membre ne voit que les groupes dont il fait partie.
 - **Joueur** : dans chaque groupe, ton compte est relié à un joueur. Si d'autres membres ont déjà saisi des parties contre toi, choisis ton nom : ces parties deviennent les tiennes.
-- **Sport ou jeu** : nom, icône et règle de victoire. Par défaut, le plus grand score gagne. On peut cocher « le plus petit score gagne » pour le golf ou certains jeux de cartes. Les sports sont communs à tous les groupes.
-- **Partie** : moi contre un ou plusieurs adversaires du même groupe, avec un score numérique pour chacun (décimales et négatifs acceptés). Elle apparaît aussi chez chacun des adversaires, de leur point de vue.
+- **Sport ou jeu** : nom, icône et règle de victoire. Par défaut, le plus grand score gagne. On peut cocher « le plus petit score gagne » pour le golf ou certains jeux de cartes, et « demander le nom du jeu » pour une catégorie comme « Jeu de société » : chaque partie indique alors le jeu (Catan, Dixit…), avec les jeux déjà saisis en suggestion. Les sports sont communs à tous les groupes.
+- **Partie** : entre joueurs du même groupe, avec des scores numériques (décimales et négatifs acceptés). Elle apparaît chez chacun des joueurs, de leur point de vue. Trois modes :
+  - **Chacun pour soi** : moi contre un ou plusieurs adversaires, un score chacun ;
+  - **Équipes** : mon équipe (moi et mes coéquipiers) contre une ou plusieurs équipes adverses, un score par équipe ;
+  - **Coopératif** : tous ensemble contre le jeu ; résultat **Gagné** ou **Perdu**, score commun facultatif.
 - **Résultat** calculé automatiquement :
-  - **victoire** si je suis seul en tête ;
+  - **victoire** si je suis (ou mon équipe est) seul en tête ;
   - **nul** si je suis à égalité en tête ;
   - **défaite** sinon.
 
-  Dans une partie à plusieurs, ma place est aussi calculée (ex. 2e/4).
+  Dans une partie à plusieurs, ma place est aussi calculée (ex. 2e/4, ou 2e/3 équipes). En coopératif, le résultat est celui saisi.
 - **Stats sur plusieurs groupes** : les joueurs reliés au même compte Google sont réunis. Tes stats « Tous mes groupes » additionnent donc tes parties de chaque groupe.
 - **Droits** : les membres d'un groupe voient toutes ses parties. Seuls l'auteur d'une partie, ses joueurs, le responsable du groupe et les administrateurs peuvent la modifier ou la supprimer. Un joueur relié à un compte ne peut être renommé que par ce compte, le responsable ou un administrateur.
 
@@ -37,14 +40,14 @@ Pour des parties avec des gens extérieurs, que les autres ne doivent pas voir :
 
 ## Onglets
 
-- **Partie** : saisie de toutes les parties d'une journée en une fois, dans le groupe choisi en haut (si tu en as plusieurs). Chaque partie a son sport, mon score, puis chaque adversaire avec son score à droite.
+- **Partie** : saisie de toutes les parties d'une journée en une fois, dans le groupe choisi en haut (si tu en as plusieurs). Chaque partie a son mode (Chacun pour soi / Équipes / Coopératif), son sport, le nom du jeu si le sport le demande, puis les joueurs et les scores.
   - **Joueurs du jour** : toucher un joueur l'ajoute comme adversaire de la partie sélectionnée (encadrée) ; le retoucher le retire.
   - **➕ Ajouter une partie** ajoute une nouvelle partie, avec le même sport que la précédente.
   - **💾 Enregistrer les N parties** enregistre tout d'un coup.
 - **Historique** : **Mes parties** (avec le bilan de chaque jour) ou **Toutes les parties** (avec le vainqueur des parties auxquelles je n'ai pas joué), pour un groupe ou tous mes groupes. Recherche, filtre par sport, détail, modification, suppression.
 - **Stats** : pour un groupe ou tous mes groupes, mes stats ou celles de n'importe quel joueur. Tous sports confondus ou par sport, sur tout, cette année ou les 30 derniers jours.
   - Parties, victoires, défaites, nuls, % de victoires, forme sur les 10 dernières parties, série en cours.
-  - **Par sport**, **Scores**, **Faits marquants** (victime préférée, bête noire…), **Face-à-face**, **Selon le nombre de joueurs**.
+  - **Par sport**, **Scores**, **Faits marquants** (victime préférée, bête noire, meilleur partenaire…), **Face-à-face** (les adversaires, y compris les joueurs des équipes adverses), **Partenaires** (bilan avec chaque coéquipier ou partenaire de jeu coopératif), **Par mode**, **Par jeu** (dans la vue d'un sport dont on note le nom du jeu), **Selon le nombre de joueurs**.
 - **Réglages** : mes groupes (mon nom dans chacun, 📤 inviter quelqu'un avec le lien et le code, ➕ rejoindre un groupe, ✨ créer un groupe), carte Groupe (gestion pour le responsable, joueurs : renommer ; un nom existant fusionne les deux), sports et jeux, export JSON, import des parties de l'ancienne version.
 
 ## Mise en place de Firebase (une seule fois, environ 10 minutes)

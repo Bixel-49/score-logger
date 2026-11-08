@@ -1,15 +1,54 @@
 // Calculs de statistiques.
-// Une partie : { id, date: 'AAAA-MM-JJ', sport: id, me: score, opponents: [{ name, score }], location, comments, createdAt }
-// Un sport   : { id, name, icon, lowerWins } ; lowerWins = le plus petit score gagne (golf, certains jeux de cartes)
+// Une partie, vue par un joueur :
+//   { id, date: 'AAAA-MM-JJ', sport: id, title, mode, me: score, opponents: [{ name, score, team }], teammates: [nom],
+//     result, location, comments, createdAt }
+//   mode : absent (chacun pour soi), 'teams' (par equipes) ou 'coop' (cooperatif)
+//   - chacun pour soi : me = mon score, opponents = les autres joueurs
+//   - equipes : me = score de mon equipe, teammates = mes coequipiers, opponents = joueurs adverses avec le score
+//     et le numero de leur equipe
+//   - cooperatif : teammates = les autres joueurs, opponents = [], result = 'W' ou 'L', me = score commun (facultatif)
+//   title : nom du jeu (jeux de societe), facultatif
+// Un sport   : { id, name, icon, lowerWins, titled } ; lowerWins = le plus petit score gagne ; titled = demander le nom du jeu
 // Resultats : 'W' victoire, 'D' nul, 'L' defaite.
+
+export const MODES = { ffa: 'Chacun pour soi', teams: 'Équipes', coop: 'Coopératif' };
+export const modeOf = (game) => (game.mode === 'teams' || game.mode === 'coop' ? game.mode : 'ffa');
 
 // > 0 si le score a est meilleur que le score b
 const compare = (a, b, lowerWins) => (lowerWins ? b - a : a - b);
+const sign = (d) => (d > 0 ? 'W' : d < 0 ? 'L' : 'D');
+
+// Scores des equipes adverses : Map numero -> score
+function otherTeams(game) {
+  const teams = new Map();
+  for (const o of game.opponents) if (!teams.has(o.team)) teams.set(o.team, o.score);
+  return teams;
+}
 
 // Victoire = seul en tete ; nul = a egalite en tete ; defaite sinon.
+// rank / size : ma place et le nombre de participants (equipes en mode equipes ; null en cooperatif)
 // duels : resultat face a chaque adversaire (ai-je fait mieux que lui ?)
+// partners : resultat partage avec chaque coequipier
 export function outcome(game, sport) {
   const lowerWins = Boolean(sport?.lowerWins);
+  const mode = modeOf(game);
+  const teammates = game.teammates || [];
+  if (mode === 'coop') {
+    const result = game.result === 'W' ? 'W' : 'L';
+    return { result, rank: null, size: teammates.length + 1, duels: [], partners: teammates.map((name) => ({ name, result })) };
+  }
+  if (mode === 'teams') {
+    const diffs = [...otherTeams(game).values()].map((s) => compare(game.me, s, lowerWins));
+    const rank = 1 + diffs.filter((d) => d < 0).length;
+    const result = rank > 1 ? 'L' : diffs.some((d) => d === 0) ? 'D' : 'W';
+    return {
+      result,
+      rank,
+      size: diffs.length + 1,
+      duels: game.opponents.map((o) => ({ name: o.name, result: sign(compare(game.me, o.score, lowerWins)) })),
+      partners: teammates.map((name) => ({ name, result })),
+    };
+  }
   const diffs = game.opponents.map((o) => compare(game.me, o.score, lowerWins));
   const rank = 1 + diffs.filter((d) => d < 0).length;
   const result = rank > 1 ? 'L' : diffs.some((d) => d === 0) ? 'D' : 'W';
@@ -17,15 +56,28 @@ export function outcome(game, sport) {
     result,
     rank,
     size: game.opponents.length + 1,
-    duels: game.opponents.map((o, i) => ({ name: o.name, result: diffs[i] > 0 ? 'W' : diffs[i] < 0 ? 'L' : 'D' })),
+    duels: game.opponents.map((o, i) => ({ name: o.name, result: sign(diffs[i]) })),
+    partners: [],
   };
 }
 
-const formatNumber = (n) => (Number.isInteger(n) ? String(n) : n.toLocaleString('fr-FR', { maximumFractionDigits: 2 }));
+export const formatNumber = (n) => (Number.isInteger(n) ? String(n) : n.toLocaleString('fr-FR', { maximumFractionDigits: 2 }));
 
 export function scoreText(game) {
+  const mode = modeOf(game);
+  if (mode === 'coop') return `${game.result === 'W' ? 'Gagné' : 'Perdu'}${Number.isFinite(game.me) ? ` · ${formatNumber(game.me)}` : ''}`;
+  if (mode === 'teams') return [game.me, ...otherTeams(game).values()].map(formatNumber).join('-');
   if (game.opponents.length === 1) return `${formatNumber(game.me)}-${formatNumber(game.opponents[0].score)}`;
   return [game.me, ...game.opponents.map((o) => o.score)].map(formatNumber).join(' · ');
+}
+
+// "vs Paul, Marie" ; en equipes "avec Luc · vs Paul, Marie" ; en cooperatif "avec Luc, Marie"
+export function versusText(game) {
+  const mode = modeOf(game);
+  const mates = game.teammates || [];
+  if (mode === 'coop') return mates.length ? `avec ${mates.join(', ')}` : 'en solo';
+  const vs = `vs ${game.opponents.map((o) => o.name).join(', ')}`;
+  return mates.length ? `avec ${mates.join(', ')} · ${vs}` : vs;
 }
 
 export const placeText = (rank, size) => `${rank}${rank === 1 ? 'er' : 'e'}/${size}`;
@@ -64,7 +116,7 @@ export function summary(games, sports) {
     addTo(total, o.result);
     streak = streak.result === o.result ? { result: o.result, length: streak.length + 1 } : { result: o.result, length: 1 };
     if (o.result === 'W') bestStreak = Math.max(bestStreak, streak.length);
-    if (o.size > 2) {
+    if (o.rank != null && o.size > 2) {
       multi += 1;
       rankSum += o.rank;
     }
@@ -85,6 +137,18 @@ export function byOpponent(games, sports) {
   return [...map.values()].sort(byRate);
 }
 
+// Bilan avec chaque partenaire (coequipier ou partenaire de jeu cooperatif)
+export function byPartner(games, sports) {
+  const map = new Map();
+  for (const g of games) {
+    for (const p of outcome(g, sports.get(g.sport)).partners) {
+      if (!map.has(p.name)) map.set(p.name, emptyTally(p.name));
+      addTo(map.get(p.name), p.result);
+    }
+  }
+  return [...map.values()].sort(byRate);
+}
+
 export function bySport(games, sports) {
   const map = new Map();
   for (const g of games) {
@@ -95,10 +159,33 @@ export function bySport(games, sports) {
   return [...map.values()].sort((a, b) => b.played - a.played || byRate(a, b));
 }
 
-// Selon le nombre de joueurs autour de la table (utile pour les jeux de societe)
+// Par nom de jeu (jeux de societe) ; les parties sans nom sont regroupees sous "Sans nom"
+export function byTitle(games, sports) {
+  const map = new Map();
+  for (const g of games) {
+    const name = (g.title || '').trim() || 'Sans nom';
+    if (!map.has(name)) map.set(name, emptyTally(name));
+    addTo(map.get(name), outcome(g, sports.get(g.sport)).result);
+  }
+  return [...map.values()].sort((a, b) => b.played - a.played || byRate(a, b));
+}
+
+// Par mode de jeu (chacun pour soi, equipes, cooperatif)
+export function byMode(games, sports) {
+  const map = new Map();
+  for (const g of games) {
+    const mode = modeOf(g);
+    if (!map.has(mode)) map.set(mode, emptyTally(mode, MODES[mode]));
+    addTo(map.get(mode), outcome(g, sports.get(g.sport)).result);
+  }
+  return [...map.values()].sort((a, b) => b.played - a.played);
+}
+
+// Selon le nombre de joueurs autour de la table (utile pour les jeux de societe) ; sans le cooperatif
 export function byTableSize(games, sports) {
   const map = new Map();
   for (const g of games) {
+    if (modeOf(g) !== 'ffa') continue;
     const o = outcome(g, sports.get(g.sport));
     if (!map.has(o.size)) map.set(o.size, { ...emptyTally(o.size, `${o.size} joueurs`), rankSum: 0 });
     const t = map.get(o.size);
@@ -121,23 +208,26 @@ const mostPlayed = (tallies) => [...tallies].sort((a, b) => b.played - a.played)
 export function highlights(games, sports) {
   const opponents = byOpponent(games, sports);
   const perSport = bySport(games, sports);
+  const partners = byPartner(games, sports);
   const opp = extremes(opponents, 2);
   const sp = extremes(perSport, 3);
+  const pa = extremes(partners, 2);
   return {
     favouriteVictim: opp.best,
     nemesis: opp.worst,
     mostFaced: mostPlayed(opponents),
+    bestPartner: pa.best,
     mostPlayedSport: perSport.length > 1 ? mostPlayed(perSport) : null,
     bestSport: perSport.length > 1 ? sp.best : null,
   };
 }
 
-// Scores d'un seul sport : moyenne et record
+// Scores d'un seul sport : moyenne et record (parties avec un score seulement)
 export function scoreStats(games, sport) {
-  if (!games.length) return null;
-  const scores = games.map((g) => g.me);
-  const record = games.reduce((best, g) => (compare(g.me, best.me, sport?.lowerWins) > 0 ? g : best));
-  return { average: scores.reduce((a, b) => a + b, 0) / scores.length, record };
+  const scored = games.filter((g) => Number.isFinite(g.me));
+  if (!scored.length) return null;
+  const record = scored.reduce((best, g) => (compare(g.me, best.me, sport?.lowerWins) > 0 ? g : best));
+  return { average: scored.reduce((a, g) => a + g.me, 0) / scored.length, record };
 }
 
 // Fiche d'un adversaire : bilan global, par sport, et parties
@@ -155,6 +245,14 @@ export function opponentProfile(games, sports, name) {
   return { total, perSport: [...map.values()].sort((a, b) => b.played - a.played), games: chronological(together).reverse() };
 }
 
+// Fiche d'un partenaire : bilan des parties jouees ensemble dans le meme camp
+export function partnerProfile(games, sports, name) {
+  const together = games.filter((g) => (g.teammates || []).includes(name));
+  const total = emptyTally(name);
+  for (const g of together) addTo(total, outcome(g, sports.get(g.sport)).result);
+  return { total, games: chronological(together).reverse() };
+}
+
 // Regroupe par jour, du plus recent au plus ancien
 export function byDay(games, sports) {
   const days = new Map();
@@ -169,17 +267,28 @@ export function byDay(games, sports) {
   });
 }
 
-// Problemes bloquants avant l'enregistrement
+// Problemes bloquants avant l'enregistrement (partie au format "vue par un joueur")
 export function validate(game) {
   const errors = [];
+  const mode = modeOf(game);
   if (!game.sport) errors.push('Choisis le sport ou le jeu.');
-  if (!Number.isFinite(game.me)) errors.push('Saisis ton score.');
-  if (!game.opponents.length) errors.push('Ajoute au moins un adversaire.');
-  game.opponents.forEach((o, i) => {
-    if (!o.name.trim()) errors.push(`Adversaire ${i + 1} : nom manquant.`);
-    else if (!Number.isFinite(o.score)) errors.push(`${o.name} : score manquant.`);
-  });
-  const names = game.opponents.map((o) => o.name.trim()).filter(Boolean);
-  if (new Set(names).size !== names.length) errors.push('Un même adversaire apparaît deux fois.');
+  const others = [...(game.teammates || []), ...game.opponents.map((o) => o.name)].map((n) => n.trim());
+  if (others.some((n) => !n)) errors.push('Un joueur n’a pas de nom.');
+  if (new Set(others.filter(Boolean)).size !== others.filter(Boolean).length) errors.push('Un même joueur apparaît deux fois.');
+  if (mode === 'coop') {
+    if (game.result !== 'W' && game.result !== 'L') errors.push('Indique si la partie est gagnée ou perdue.');
+    return errors;
+  }
+  if (!Number.isFinite(game.me)) errors.push(mode === 'teams' ? 'Saisis le score de ton équipe.' : 'Saisis ton score.');
+  if (!game.opponents.length) errors.push(mode === 'teams' ? 'Ajoute au moins un joueur dans l’équipe adverse.' : 'Ajoute au moins un adversaire.');
+  if (mode === 'teams') {
+    const teams = new Map();
+    for (const o of game.opponents) teams.set(o.team, o.score);
+    for (const [team, score] of teams) if (!Number.isFinite(score)) errors.push(`Équipe ${team + 1} : score manquant.`);
+  } else {
+    game.opponents.forEach((o) => {
+      if (o.name.trim() && !Number.isFinite(o.score)) errors.push(`${o.name} : score manquant.`);
+    });
+  }
   return errors;
 }

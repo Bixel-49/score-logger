@@ -9,13 +9,20 @@ import {
   winRate,
   summary,
   byOpponent,
+  byPartner,
   bySport,
+  byTitle,
+  byMode,
   byTableSize,
   highlights,
   scoreStats,
   opponentProfile,
+  partnerProfile,
   byDay,
   validate,
+  versusText,
+  modeOf,
+  MODES,
 } from './stats.js';
 
 // ---------------------------------------------------------------------------
@@ -172,7 +179,7 @@ const shortDate = (iso) => parseDate(iso).toLocaleDateString('fr-FR', { day: 'nu
 
 // Une partie en cours de saisie
 function emptyRow(sport = '') {
-  return { id: null, createdAt: null, sport, me: null, opponents: [], comments: '' };
+  return { id: null, createdAt: null, sport, title: '', mode: null, me: null, opponents: [], teammates: [], teams: [], result: null, comments: '' };
 }
 
 function lastSportId() {
@@ -329,14 +336,14 @@ const PRESETS = [
   { name: 'Fléchettes', icon: '🎯' },
   { name: 'Échecs', icon: '♟️' },
   { name: 'Belote', icon: '🃏' },
-  { name: 'Jeu de société', icon: '🎲' },
+  { name: 'Jeu de société', icon: '🎲', titled: true },
   { name: 'Golf', icon: '⛳', lowerWins: true },
 ];
 
 const ICONS = ['🎾', '🏓', '🏸', '🎯', '⛳', '🎳', '🏀', '⚽', '🏐', '♟️', '🃏', '🎲', '🧩', '🀄', '🎮', '🏅'];
 
 function openSportSheet(sport, onSaved) {
-  const draft = { name: '', icon: '🏅', lowerWins: false, ...sport };
+  const draft = { name: '', icon: '🏅', lowerWins: false, titled: false, ...sport };
   const existing = store.getSports().map((s) => normalize(s.name));
   openSheet(sport ? 'Modifier le sport' : 'Nouveau sport ou jeu', (close) => {
     const save = async (value) => {
@@ -393,6 +400,12 @@ function openSportSheet(sport, onSaved) {
           { class: 'field toggle' },
           h('input', { type: 'checkbox', checked: Boolean(draft.lowerWins), onchange: (ev) => (draft.lowerWins = ev.target.checked) }),
           h('span', {}, 'Le plus petit score gagne (golf, certains jeux de cartes…)'),
+        ),
+        h(
+          'label',
+          { class: 'field toggle' },
+          h('input', { type: 'checkbox', checked: Boolean(draft.titled), onchange: (ev) => (draft.titled = ev.target.checked) }),
+          h('span', {}, 'Demander le nom du jeu à chaque partie (jeux de société : Catan, Dixit…)'),
         ),
       ],
       actions: [h('button', { class: 'btn primary', onclick: () => save(draft) }, 'Enregistrer')],
@@ -458,29 +471,94 @@ function resultPill(result) {
   return h('span', { class: `result ${cls}`, title: label }, letter);
 }
 
-const rowIsEmpty = (row) => row.me == null && !row.opponents.length;
-const rowComplete = (row) => Number.isFinite(row.me) && row.opponents.length > 0 && row.opponents.every((o) => Number.isFinite(o.score));
+// Une ligne de saisie selon son mode (voir stats.js) :
+//   commun     : { id, createdAt, sport, title, owner, comments, me, mode }
+//   ffa        : opponents: [{ name, score }]
+//   teams      : teammates: [nom], teams: [{ players: [nom], score }] (equipes adverses)
+//   coop       : teammates: [nom], result: 'W' | 'L' | null
+const rowMode = (row) => (row.mode === 'teams' || row.mode === 'coop' ? row.mode : 'ffa');
+
+// Tous les noms de joueurs de la ligne (hors moi)
+function rowNames(row) {
+  const mode = rowMode(row);
+  if (mode === 'ffa') return row.opponents.map((o) => o.name);
+  if (mode === 'coop') return [...(row.teammates || [])];
+  return [...(row.teammates || []), ...(row.teams || []).flatMap((t) => t.players)];
+}
+
+const rowIsEmpty = (row) => row.me == null && !rowNames(row).length && !row.result && !(row.title || '').trim();
+
+// Change le mode en gardant les joueurs deja choisis
+function setRowMode(row, mode) {
+  const names = rowNames(row).filter(Boolean);
+  row.mode = mode === 'ffa' ? null : mode;
+  row.opponents = mode === 'ffa' ? names.map((name) => ({ name, score: null })) : [];
+  row.teammates = mode === 'coop' ? names : [];
+  row.teams = mode === 'teams' ? [{ players: names, score: null }] : [];
+  row.result = null;
+}
 
 function rowToRecord(e, row) {
+  const mode = rowMode(row);
+  const trim = (n) => n.trim();
   return {
     id: row.id,
     createdAt: row.createdAt,
     date: e.date || today(),
     location: e.location.trim(),
     sport: row.sport,
+    title: (row.title || '').trim(),
+    mode: mode === 'ffa' ? null : mode,
     me: row.me,
-    opponents: row.opponents.map((o) => ({ name: o.name.trim(), score: o.score })),
+    teammates: mode === 'ffa' ? [] : (row.teammates || []).map(trim),
+    opponents:
+      mode === 'ffa'
+        ? row.opponents.map((o) => ({ name: o.name.trim(), score: o.score }))
+        : mode === 'teams'
+          ? (row.teams || []).flatMap((t, k) => t.players.map((name) => ({ name: name.trim(), score: t.score, team: k + 1 })))
+          : [],
+    result: mode === 'coop' ? row.result : null,
     comments: row.comments || '',
     owner: row.owner || null,
     group: editorGroup(),
   };
 }
 
+// Partie enregistree (vue par un joueur) -> ligne de saisie
+function recordToRow(r) {
+  const mode = modeOf(r);
+  const row = {
+    id: r.id,
+    createdAt: r.createdAt,
+    sport: r.sport,
+    title: r.title || '',
+    owner: r.owner || null,
+    comments: r.comments || '',
+    me: Number.isFinite(r.me) ? r.me : null,
+    mode: mode === 'ffa' ? null : mode,
+    opponents: [],
+    teammates: [...(r.teammates || [])],
+    teams: [],
+    result: r.result || null,
+  };
+  if (mode === 'ffa') row.opponents = r.opponents.map(({ name, score }) => ({ name, score }));
+  if (mode === 'teams') {
+    const teams = new Map();
+    for (const o of r.opponents) {
+      if (!teams.has(o.team)) teams.set(o.team, { players: [], score: o.score });
+      teams.get(o.team).players.push(o.name);
+    }
+    row.teams = [...teams.values()];
+  }
+  return row;
+}
+
 // Pastille V / N / D et place, des que tous les scores sont saisis
 function rowStatus(row, sports) {
-  if (!rowComplete(row)) return null;
-  const o = outcome(row, sports.get(row.sport));
-  return [resultPill(o.result), o.size > 2 ? h('span', { class: 'muted small' }, placeText(o.rank, o.size)) : null];
+  const record = rowToRecord(state.editor, row);
+  if (validate(record).length) return null;
+  const o = outcome(record, sports.get(row.sport));
+  return [resultPill(o.result), o.rank != null && o.size > 2 ? h('span', { class: 'muted small' }, placeText(o.rank, o.size)) : null];
 }
 
 // Champ de score : nombres decimaux et negatifs acceptes
@@ -512,7 +590,7 @@ function openInEditor(record) {
     date: record.date,
     location: record.location || '',
     group: record.group,
-    rows: [{ ...structuredClone(record) }],
+    rows: [recordToRow(structuredClone(record))],
     active: 0,
     editing: true,
     dirty: false,
@@ -538,8 +616,8 @@ function saveEditor() {
     // Sans joueur dans ce groupe (administrateur), il faut choisir le joueur principal
     if (!r.owner && !store.myPid(r.group)) return ['Choisis le joueur principal (tu n’as pas de joueur dans ce groupe).'];
     const owner = normalize(r.owner || store.getMe(r.group));
-    const self = r.opponents.some((o) => normalize(o.name.trim()) === owner);
-    const message = r.owner ? `${r.owner} ne peut pas être son propre adversaire.` : 'Tu ne peux pas être ton propre adversaire.';
+    const self = [...r.teammates, ...r.opponents.map((o) => o.name)].some((n) => normalize(n.trim()) === owner);
+    const message = r.owner ? `${r.owner} apparaît deux fois dans la partie.` : 'Tu apparais deux fois dans la partie.';
     return [...validate(r), ...(self ? [message] : [])];
   };
   const errors = records.flatMap((r, i) => check(r).map((msg) => (e.rows.length > 1 ? `Partie ${e.rows.indexOf(rows[i]) + 1} : ${msg}` : msg)));
@@ -571,12 +649,21 @@ function saveEditor() {
 function dayChips(e, dayGames, toggle, addNew) {
   const present = [
     ...new Set([
-      ...dayGames.flatMap((g) => g.opponents.map((o) => o.name)),
-      ...e.rows.flatMap((r) => r.opponents.map((o) => o.name)).filter(Boolean),
+      ...dayGames.flatMap((g) => [...g.opponents.map((o) => o.name), ...(g.teammates || [])]),
+      ...e.rows.flatMap((r) => rowNames(r)).filter(Boolean),
       ...store.getDayPlayers(e.date),
     ]),
   ];
-  const inRow = e.rows[e.active].opponents.map((o) => o.name);
+  const row = e.rows[e.active];
+  const mode = rowMode(row);
+  const inRow = rowNames(row);
+  // Role du joueur dans la partie selectionnee
+  const role = (name) => {
+    if (mode === 'ffa') return 'Adversaire';
+    if (mode === 'coop' || (row.teammates || []).includes(name)) return mode === 'coop' ? 'Partenaire' : 'Mon équipe';
+    const k = (row.teams || []).findIndex((t) => t.players.includes(name));
+    return `Équipe ${k + 2}`;
+  };
   const regulars = playersByFrequency()
     .filter((n) => !present.includes(n))
     .slice(0, Math.max(0, 8 - present.length));
@@ -589,8 +676,9 @@ function dayChips(e, dayGames, toggle, addNew) {
         onclick: () => toggle(name),
       },
       h('span', {}, name),
-      inRow.includes(name) ? h('span', { class: 'pchip-role' }, 'Adversaire') : null,
+      inRow.includes(name) ? h('span', { class: 'pchip-role' }, role(name)) : null,
     );
+  const hint = { ffa: 'touche les adversaires', teams: 'touche les adversaires (équipe 2)', coop: 'touche tes partenaires' }[mode];
   return h(
     'section',
     { class: 'card day-players' },
@@ -598,14 +686,14 @@ function dayChips(e, dayGames, toggle, addNew) {
       'div',
       { class: 'day-head' },
       h('h2', { class: 'card-title' }, 'Joueurs du jour'),
-      h('span', { class: 'muted small' }, `${e.rows.length > 1 ? `Partie ${e.active + 1} : t` : 'T'}ouche les adversaires`),
+      h('span', { class: 'muted small' }, e.rows.length > 1 ? `Partie ${e.active + 1} : ${hint}` : hint.charAt(0).toUpperCase() + hint.slice(1)),
     ),
     h(
       'div',
       { class: 'pchips' },
       present.map((n) => chip(n, false)),
       regulars.map((n) => chip(n, true)),
-      h('button', { class: 'pchip add', onclick: () => openPlayerPicker('Ajouter un adversaire', '', [...present, ...inRow], addNew) }, '➕ Joueur'),
+      h('button', { class: 'pchip add', onclick: () => openPlayerPicker('Ajouter un joueur', '', [...present, ...inRow], addNew) }, '➕ Joueur'),
     ),
   );
 }
@@ -625,11 +713,95 @@ function dayGamesCard(date, dayGames, sports) {
   );
 }
 
-// Une partie : le sport, moi, puis chaque adversaire avec son score a droite
-function gameRow(e, row, i, sports, { select, toggleOpponent }) {
+// Ajoute un joueur a la ligne. target : 'mate' (mon equipe / partenaires), un numero d'equipe adverse, ou rien (selon le mode)
+function addToRow(row, name, target) {
+  const mode = rowMode(row);
+  if (mode === 'ffa') row.opponents.push({ name, score: null });
+  else if (mode === 'coop' || target === 'mate') (row.teammates ||= []).push(name);
+  else {
+    row.teams ||= [];
+    if (!row.teams.length) row.teams.push({ players: [], score: null });
+    row.teams[Number.isInteger(target) ? target : 0].players.push(name);
+  }
+}
+
+function removeFromRow(row, name) {
+  row.opponents = row.opponents.filter((o) => o.name !== name);
+  row.teammates = (row.teammates || []).filter((n) => n !== name);
+  for (const t of row.teams || []) t.players = t.players.filter((n) => n !== name);
+}
+
+// Case du joueur principal : "Moi", ou un autre joueur choisi par le responsable du groupe / un administrateur
+function ownerSlot(e, row, taken) {
+  const manage = store.canManage(e.group);
+  const hasMe = Boolean(store.myPid(e.group));
+  return h(
+    manage ? 'button' : 'div',
+    {
+      class: `slot me ${manage ? 'filled' : ''}`,
+      onclick: manage
+        ? () =>
+            openPlayerPicker(
+              'Joueur principal',
+              row.owner || '',
+              taken,
+              (name) => {
+                const mine = hasMe && normalize(name) === normalize(store.getMe(e.group));
+                row.owner = name && !mine ? name : null;
+                touchEditor();
+                rerenderKeepScroll();
+              },
+              hasMe ? `↩️ Revenir à moi (${meLabel()})` : 'Retirer ce joueur',
+            )
+        : null,
+    },
+    h('span', { class: 'slot-label' }, row.owner ? 'Joueur' : !hasMe ? 'Toucher pour choisir le joueur' : manage ? 'Moi · toucher pour changer' : 'Moi'),
+    h('span', { class: 'slot-name' }, row.owner || (hasMe ? meLabel() : '—')),
+  );
+}
+
+// Pastille d'un joueur dans une equipe, avec ✕ pour le retirer
+function memberChip(row, name) {
+  return h(
+    'span',
+    { class: 'pchip opponent team-chip' },
+    h('span', {}, name),
+    h(
+      'button',
+      {
+        class: 'chip-x',
+        'aria-label': `Retirer ${name}`,
+        onclick: () => {
+          removeFromRow(row, name);
+          touchEditor();
+          rerenderKeepScroll();
+        },
+      },
+      '✕',
+    ),
+  );
+}
+
+// Une partie : mode, sport (et nom du jeu), puis les joueurs et les scores selon le mode
+function gameRow(e, row, i, sports, { select }) {
   const status = h('span', { class: 'mrow-pill' }, rowStatus(row, sports));
   const refresh = () => status.replaceChildren(...(rowStatus(row, sports) || []).filter(Boolean));
-  const taken = row.opponents.map((o) => o.name);
+  const taken = rowNames(row);
+  const mode = rowMode(row);
+  const sport = sports.get(row.sport);
+  const changed = () => {
+    touchEditor();
+    rerenderKeepScroll();
+  };
+  const pick = (title, target) => {
+    select(i);
+    openPlayerPicker(title, '', taken, (name) => {
+      if (!name) return;
+      addToRow(row, name, target);
+      store.addDayPlayer(e.date, name);
+      changed();
+    });
+  };
 
   const sportSelect = h(
     'select',
@@ -641,20 +813,195 @@ function gameRow(e, row, i, sports, { select, toggleOpponent }) {
           ev.target.value = row.sport;
           openSportSheet(null, (saved) => {
             row.sport = saved.id;
-            touchEditor();
-            rerenderKeepScroll();
+            changed();
           });
           return;
         }
         row.sport = ev.target.value;
-        touchEditor();
-        refresh();
+        // Le champ "Nom du jeu" apparait ou disparait selon le sport
+        changed();
       },
     },
     row.sport ? null : h('option', { value: '', selected: true, disabled: true }, 'Choisir…'),
     store.getSports().map((s) => h('option', { value: s.id, selected: s.id === row.sport }, sportLabel(s))),
     h('option', { value: '__new' }, '➕ Nouveau sport ou jeu…'),
   );
+
+  // Nom du jeu (jeux de societe), avec les jeux deja saisis en suggestion
+  const titleField = sport?.titled
+    ? [
+        h('input', {
+          class: 'input',
+          list: `titles-${i}`,
+          placeholder: 'Nom du jeu (Catan, Dixit…)',
+          'aria-label': 'Nom du jeu',
+          value: row.title || '',
+          oninput: (ev) => {
+            row.title = ev.target.value;
+            touchEditor();
+          },
+        }),
+        h('datalist', { id: `titles-${i}` }, store.getTitles(row.sport).map((t) => h('option', { value: t }))),
+      ]
+    : null;
+
+  const modeTabs = h(
+    'div',
+    { class: 'segmented small', role: 'tablist', style: 'grid-template-columns: repeat(3, 1fr)' },
+    Object.entries(MODES).map(([key, label]) =>
+      h(
+        'button',
+        {
+          role: 'tab',
+          'aria-selected': String(key === mode),
+          onclick: (ev) => {
+            ev.stopPropagation();
+            if (key === mode) return;
+            setRowMode(row, key);
+            changed();
+          },
+        },
+        label,
+      ),
+    ),
+  );
+
+  let body;
+  if (mode === 'ffa') {
+    body = [
+      h(
+        'div',
+        { class: 'prow' },
+        ownerSlot(e, row, taken),
+        scoreInput(row, 'me', 'moi', refresh),
+        h('span', {}),
+        row.opponents.map((o, k) => [
+          h(
+            'button',
+            {
+              class: 'slot filled',
+              onclick: () =>
+                openPlayerPicker(`Adversaire ${k + 1}`, o.name, taken.filter((n) => n !== o.name), (name) => {
+                  if (!name) row.opponents.splice(k, 1);
+                  else {
+                    o.name = name;
+                    store.addDayPlayer(e.date, name);
+                  }
+                  changed();
+                }),
+            },
+            h('span', { class: 'slot-label' }, `Adversaire ${row.opponents.length > 1 ? k + 1 : ''}`),
+            h('span', { class: 'slot-name' }, o.name),
+          ),
+          scoreInput(o, 'score', o.name, refresh),
+          h(
+            'button',
+            {
+              class: 'icon-btn',
+              'aria-label': `Retirer ${o.name}`,
+              onclick: () => {
+                row.opponents.splice(k, 1);
+                changed();
+              },
+            },
+            '✕',
+          ),
+        ]),
+      ),
+      h('button', { class: 'btn small ghost', onclick: () => pick('Ajouter un adversaire') }, '➕ Adversaire'),
+    ];
+  } else if (mode === 'teams') {
+    row.teams ||= [];
+    if (!row.teams.length) row.teams.push({ players: [], score: null });
+    body = [
+      h(
+        'div',
+        { class: 'team mine' },
+        h('div', { class: 'team-head' }, h('strong', {}, 'Mon équipe'), scoreInput(row, 'me', 'mon équipe', refresh)),
+        ownerSlot(e, row, taken),
+        h(
+          'div',
+          { class: 'pchips' },
+          (row.teammates || []).map((n) => memberChip(row, n)),
+          h('button', { class: 'pchip add', onclick: () => pick('Ajouter un coéquipier', 'mate') }, '➕ Coéquipier'),
+        ),
+      ),
+      row.teams.map((t, k) =>
+        h(
+          'div',
+          { class: 'team' },
+          h(
+            'div',
+            { class: 'team-head' },
+            h('strong', {}, `Équipe ${k + 2}`),
+            scoreInput(t, 'score', `équipe ${k + 2}`, refresh),
+            row.teams.length > 1
+              ? h(
+                  'button',
+                  {
+                    class: 'icon-btn',
+                    'aria-label': `Retirer l’équipe ${k + 2}`,
+                    onclick: () => {
+                      row.teams.splice(k, 1);
+                      changed();
+                    },
+                  },
+                  '✕',
+                )
+              : null,
+          ),
+          h(
+            'div',
+            { class: 'pchips' },
+            t.players.map((n) => memberChip(row, n)),
+            h('button', { class: 'pchip add', onclick: () => pick(`Ajouter un joueur à l’équipe ${k + 2}`, k) }, '➕ Joueur'),
+          ),
+        ),
+      ),
+      h(
+        'button',
+        {
+          class: 'btn small ghost',
+          onclick: () => {
+            row.teams.push({ players: [], score: null });
+            changed();
+          },
+        },
+        '➕ Ajouter une équipe',
+      ),
+    ];
+  } else {
+    body = [
+      h(
+        'div',
+        { class: 'segmented', role: 'group', 'aria-label': 'Résultat', style: 'grid-template-columns: repeat(2, 1fr)' },
+        [
+          ['W', '🏆 Gagné'],
+          ['L', '💀 Perdu'],
+        ].map(([key, label]) =>
+          h(
+            'button',
+            {
+              'aria-selected': String(row.result === key),
+              onclick: () => {
+                row.result = row.result === key ? null : key;
+                changed();
+              },
+            },
+            label,
+          ),
+        ),
+      ),
+      field('Score commun (facultatif)', scoreInput(row, 'me', 'commun', refresh)),
+      ownerSlot(e, row, taken),
+      h(
+        'div',
+        { class: 'pchips' },
+        (row.teammates || []).map((n) => memberChip(row, n)),
+        h('button', { class: 'pchip add', onclick: () => pick('Ajouter un partenaire', 'mate') }, '➕ Partenaire'),
+      ),
+    ];
+  }
 
   return h(
     'section',
@@ -679,94 +1026,17 @@ function gameRow(e, row, i, sports, { select, toggleOpponent }) {
                 if (!rowIsEmpty(row) && !confirm(`Retirer la partie ${i + 1} de la saisie ?`)) return;
                 e.rows.splice(i, 1);
                 e.active = Math.min(e.active, e.rows.length - 1);
-                touchEditor();
-                rerenderKeepScroll();
+                changed();
               },
             },
             '✕',
           )
         : null,
     ),
+    modeTabs,
     sportSelect,
-    h(
-      'div',
-      { class: 'prow' },
-      // Un administrateur peut saisir une partie sans y jouer : il remplace "Moi" par un autre joueur
-      h(
-        store.canManage(e.group) ? 'button' : 'div',
-        {
-          class: `slot me ${store.canManage(e.group) ? 'filled' : ''}`,
-          onclick: store.canManage(e.group)
-            ? () =>
-                openPlayerPicker(
-                  'Joueur principal',
-                  row.owner || '',
-                  taken,
-                  (name) => {
-                    const mine = store.myPid(e.group) && normalize(name) === normalize(store.getMe(e.group));
-                    row.owner = name && !mine ? name : null;
-                    touchEditor();
-                    rerenderKeepScroll();
-                  },
-                  store.myPid(e.group) ? `↩️ Revenir à moi (${meLabel()})` : 'Retirer ce joueur',
-                )
-            : null,
-        },
-        h(
-          'span',
-          { class: 'slot-label' },
-          row.owner ? 'Joueur' : !store.myPid(e.group) ? 'Toucher pour choisir le joueur' : store.canManage(e.group) ? 'Moi · toucher pour changer' : 'Moi',
-        ),
-        h('span', { class: 'slot-name' }, row.owner || (store.myPid(e.group) ? meLabel() : '—')),
-      ),
-      scoreInput(row, 'me', 'moi', refresh),
-      h('span', {}),
-      row.opponents.map((o, k) => [
-        h(
-          'button',
-          {
-            class: 'slot filled',
-            onclick: () =>
-              openPlayerPicker(`Adversaire ${k + 1}`, o.name, taken.filter((n) => n !== o.name), (name) => {
-                if (!name) row.opponents.splice(k, 1);
-                else {
-                  o.name = name;
-                  store.addDayPlayer(e.date, name);
-                }
-                touchEditor();
-                rerenderKeepScroll();
-              }),
-          },
-          h('span', { class: 'slot-label' }, `Adversaire ${row.opponents.length > 1 ? k + 1 : ''}`),
-          h('span', { class: 'slot-name' }, o.name),
-        ),
-        scoreInput(o, 'score', o.name, refresh),
-        h(
-          'button',
-          {
-            class: 'icon-btn',
-            'aria-label': `Retirer ${o.name}`,
-            onclick: () => {
-              row.opponents.splice(k, 1);
-              touchEditor();
-              rerenderKeepScroll();
-            },
-          },
-          '✕',
-        ),
-      ]),
-    ),
-    h(
-      'button',
-      {
-        class: 'btn small ghost',
-        onclick: () => {
-          select(i);
-          openPlayerPicker('Ajouter un adversaire', '', taken, (name) => name && toggleOpponent(i, name));
-        },
-      },
-      '➕ Adversaire',
-    ),
+    titleField,
+    body,
   );
 }
 
@@ -819,10 +1089,9 @@ function renderGameView() {
 
   const toggleOpponent = (i, name) => {
     const row = e.rows[i];
-    const k = row.opponents.findIndex((o) => o.name === name);
-    if (k >= 0) row.opponents.splice(k, 1);
+    if (rowNames(row).includes(name)) removeFromRow(row, name);
     else {
-      row.opponents.push({ name, score: null });
+      addToRow(row, name);
       store.addDayPlayer(e.date, name);
     }
     e.active = i;
@@ -927,7 +1196,10 @@ function renderGameView() {
             class: 'btn add-match',
             onclick: () => {
               // Meme sport et meme joueur principal que la partie precedente
-              e.rows.push({ ...emptyRow(e.rows.at(-1).sport), owner: e.rows.at(-1).owner || null });
+              const prev = e.rows.at(-1);
+              const next = { ...emptyRow(prev.sport), owner: prev.owner || null };
+              if (rowMode(prev) !== 'ffa') setRowMode(next, rowMode(prev));
+              e.rows.push(next);
               e.active = e.rows.length - 1;
               touchEditor();
               rerenderKeepScroll();
@@ -974,23 +1246,50 @@ function gameItem(g, sports, onclick) {
     h(
       'span',
       { class: 'match-main' },
-      h('span', { class: 'match-name' }, sportLabel(sport), o.size > 2 ? h('span', { class: 'muted' }, ` · ${placeText(o.rank, o.size)}`) : null),
-      h('span', { class: 'muted' }, `vs ${g.opponents.map((x) => x.name).join(', ')}${groupSuffix(g)}`),
+      h('span', { class: 'match-name' }, gameLabel(g, sport), o.rank != null && o.size > 2 ? h('span', { class: 'muted' }, ` · ${placeText(o.rank, o.size)}`) : null),
+      h('span', { class: 'muted' }, `${modeOf(g) !== 'ffa' ? `${modeOf(g) === 'coop' ? '🤝' : '👥'} ` : ''}${versusText(g)}${groupSuffix(g)}`),
     ),
     h('span', { class: 'match-score' }, scoreText(g)),
   );
 }
 
-// Joueurs du meilleur au moins bon
-function ranking(g, sport) {
-  return [...g.players].sort((a, b) => (sport?.lowerWins ? a.score - b.score : b.score - a.score));
+// Camps d'une partie du groupe, du meilleur au moins bon : [{ players: [{ name, key, score }], score }]
+// Chacun pour soi : un camp par joueur ; equipes : un camp par equipe ; cooperatif : un seul camp
+function sides(g, sport) {
+  const mode = modeOf(g);
+  if (mode === 'coop') return [{ players: g.players, score: g.players[0]?.score ?? null }];
+  const map = new Map();
+  g.players.forEach((p, k) => {
+    const id = mode === 'teams' ? `t${p.team}` : `p${k}`;
+    if (!map.has(id)) map.set(id, { players: [], score: p.score });
+    map.get(id).players.push(p);
+  });
+  return [...map.values()].sort((a, b) => (sport?.lowerWins ? a.score - b.score : b.score - a.score));
 }
+
+const sideName = (side) => side.players.map((p) => p.name).join(' & ');
+
+// Sport, suivi du nom du jeu s'il y en a un
+const gameLabel = (g, sport) => `${sportLabel(sport)}${g.title ? ` · ${g.title}` : ''}`;
 
 // Partie du groupe a laquelle je n'ai pas participe : vainqueur(s) au lieu de V / N / D
 function groupGameItem(g, sports, onclick) {
   const sport = sports.get(g.sport);
-  const ranked = ranking(g, sport);
-  const winners = ranked.filter((p) => p.score === ranked[0].score).map((p) => p.name);
+  const mode = modeOf(g);
+  const list = sides(g, sport);
+  let headline;
+  let detail;
+  let score;
+  if (mode === 'coop') {
+    headline = g.result === 'W' ? ' · 🏆 Gagné ensemble' : ' · 💀 Perdu ensemble';
+    detail = g.players.map((p) => p.name).join(', ');
+    score = Number.isFinite(list[0].score) ? formatScore(list[0].score) : '';
+  } else {
+    const winners = list.filter((sd) => sd.score === list[0].score).map(sideName);
+    headline = ` · 🏆 ${winners.join(', ')}${winners.length > 1 ? ' (égalité)' : ''}`;
+    detail = list.map(sideName).join(' vs ');
+    score = list.map((sd) => formatScore(sd.score)).join(mode === 'teams' ? '-' : ' · ');
+  }
   return h(
     'button',
     { class: 'match-item', onclick },
@@ -998,10 +1297,10 @@ function groupGameItem(g, sports, onclick) {
     h(
       'span',
       { class: 'match-main' },
-      h('span', { class: 'match-name' }, sportLabel(sport), h('span', { class: 'muted' }, ` · 🏆 ${winners.join(', ')}${winners.length > 1 ? ' (égalité)' : ''}`)),
-      h('span', { class: 'muted' }, `${g.players.map((p) => p.name).join(' vs ')}${groupSuffix(g)}`),
+      h('span', { class: 'match-name' }, gameLabel(g, sport), h('span', { class: 'muted' }, headline)),
+      h('span', { class: 'muted' }, `${detail}${groupSuffix(g)}`),
     ),
-    h('span', { class: 'match-score' }, ranked.map((p) => formatScore(p.score)).join(' · ')),
+    h('span', { class: 'match-score' }, score),
   );
 }
 
@@ -1012,11 +1311,12 @@ function openGameActions(g) {
   const myKey = store.myKey();
   const mine = g.me !== undefined ? g : store.perspective(g, myKey);
   const o = mine ? outcome(mine, sport) : null;
-  const lines = ranking(g, sport).map((p) => ({ ...p, me: p.key === myKey }));
+  const mode = modeOf(g);
+  const list = sides(g, sport);
   const editable = store.canEdit(g);
   // Un administrateur peut modifier une partie sans y avoir joue : on la saisit du point de vue du premier joueur
   const editTarget = mine || (editable && g.players.length ? { ...store.perspective(g, g.players[0].key), owner: g.players[0].name } : null);
-  openSheet(o ? `${sportLabel(sport)} · ${RESULTS[o.result][2]}` : sportLabel(sport), (close) => ({
+  openSheet(o ? `${gameLabel(g, sport)} · ${RESULTS[o.result][2]}` : gameLabel(g, sport), (close) => ({
     body: [
       h(
         'dl',
@@ -1025,7 +1325,9 @@ function openGameActions(g) {
         h('dd', {}, longDate(g.date)),
         store.getGroups().length > 1 ? [h('dt', {}, 'Groupe'), h('dd', {}, store.groupName(g.group))] : null,
         g.location ? [h('dt', {}, 'Lieu'), h('dd', {}, g.location)] : null,
-        o && o.size > 2 ? [h('dt', {}, 'Place'), h('dd', {}, placeText(o.rank, o.size))] : null,
+        mode !== 'ffa' ? [h('dt', {}, 'Mode'), h('dd', {}, MODES[mode])] : null,
+        mode === 'coop' ? [h('dt', {}, 'Résultat'), h('dd', {}, g.result === 'W' ? '🏆 Gagné' : '💀 Perdu')] : null,
+        o && o.rank != null && o.size > 2 ? [h('dt', {}, 'Place'), h('dd', {}, placeText(o.rank, o.size))] : null,
         g.createdByName ? [h('dt', {}, 'Saisie par'), h('dd', {}, g.createdByName)] : null,
       ),
       h(
@@ -1034,7 +1336,13 @@ function openGameActions(g) {
         h(
           'tbody',
           {},
-          lines.map((l) => h('tr', {}, h('td', {}, l.me ? h('strong', {}, l.name) : l.name), h('td', { class: 'num' }, l.me ? h('strong', {}, String(l.score)) : String(l.score)))),
+          // Une ligne par camp (joueur, equipe, ou tous en cooperatif) ; mon camp en gras
+          list.map((sd) => {
+            const mineSide = sd.players.some((p) => p.key === myKey);
+            const names = sd.players.map((p) => p.name).join(', ');
+            const score = Number.isFinite(sd.score) ? formatScore(sd.score) : '–';
+            return h('tr', {}, h('td', {}, mineSide ? h('strong', {}, names) : names), h('td', { class: 'num' }, mineSide ? h('strong', {}, score) : score));
+          }),
         ),
       ),
       g.comments ? h('p', { class: 'comment' }, g.comments) : null,
@@ -1103,7 +1411,7 @@ function renderHistoryView() {
   const filtered = all.filter(
     (g) =>
       (!state.historySport || g.sport === state.historySport) &&
-      (!q || normalize(`${g.players.map((p) => p.name).join(' ')} ${g.location || ''} ${g.date} ${sports.get(g.sport)?.name || ''}`).includes(q)),
+      (!q || normalize(`${g.players.map((p) => p.name).join(' ')} ${g.title || ''} ${g.location || ''} ${g.date} ${sports.get(g.sport)?.name || ''}`).includes(q)),
   );
 
   let content;
@@ -1168,7 +1476,7 @@ function renderHistoryView() {
             type: 'search',
             class: 'input',
             id: 'history-search',
-            placeholder: 'Rechercher (joueur, lieu, date)…',
+            placeholder: 'Rechercher (joueur, jeu, lieu, date)…',
             value: state.historyQuery,
             oninput: (e) => {
               state.historyQuery = e.target.value;
@@ -1320,6 +1628,24 @@ function openOpponentSheet(name) {
   }));
 }
 
+function openPartnerSheet(name) {
+  const sports = sportsMap();
+  const p = partnerProfile(periodGames(), sports, name);
+  const sport = sports.get(state.sport);
+  openSheet(state.sport ? `Avec ${name} · ${sport?.name}` : `Avec ${name}`, () => ({
+    body: [
+      h('div', { class: 'tiles two' }, tile(percent(p.total), 'Victoires ensemble'), tile(p.total.played, 'Parties dans le même camp')),
+      h('p', { class: 'center' }, recordText(p.total)),
+      h('h3', { class: 'sub-title' }, 'Parties'),
+      h(
+        'ul',
+        { class: 'match-list' },
+        p.games.map((g) => h('li', {}, gameItem(g, sports))),
+      ),
+    ],
+  }));
+}
+
 function highlightRow(icon, label, t, detail, onclick) {
   if (!t) return null;
   return h(
@@ -1361,6 +1687,10 @@ function renderStatsView() {
     const streak = sum.streak.length ? `${sum.streak.length} ${RESULTS[sum.streak.result][1]}` : '–';
     const scores = sport ? scoreStats(games, sport) : null;
     const sizes = sport ? byTableSize(games, sports) : [];
+    const partners = byPartner(games, sports);
+    // Par jeu : seulement dans la vue d'un sport (jeux de societe)
+    const titles = sport ? byTitle(games, sports) : [];
+    const modes = byMode(games, sports);
     body = [
       h(
         'div',
@@ -1413,6 +1743,7 @@ function renderStatsView() {
           highlightRow('🤝', 'Adversaire le plus fréquent', hl.mostFaced, (t) => plural(t.played, 'partie'), () => openOpponentSheet(hl.mostFaced.name)),
           highlightRow('🎯', 'Victime préférée', hl.favouriteVictim, recordText, () => openOpponentSheet(hl.favouriteVictim.name)),
           highlightRow('👹', 'Bête noire', hl.nemesis, recordText, () => openOpponentSheet(hl.nemesis.name)),
+          highlightRow('🤝', 'Meilleur partenaire', hl.bestPartner, recordText, () => openPartnerSheet(hl.bestPartner.name)),
         ),
         h('p', { class: 'muted small' }, 'Classement au % de victoires, à partir de 2 parties (3 pour les sports).'),
       ),
@@ -1423,6 +1754,19 @@ function renderStatsView() {
         tallyTable(byOpponent(games, sports), { label: 'Adversaire', onRow: (t) => openOpponentSheet(t.name) }),
         h('p', { class: 'muted small' }, 'Dans une partie à plusieurs, chaque adversaire compte à part : as-tu fait mieux que lui ?'),
       ),
+      partners.length
+        ? h(
+            'section',
+            { class: 'card' },
+            h('h2', { class: 'card-title' }, 'Partenaires'),
+            tallyTable(partners, { label: 'Partenaire', onRow: (t) => openPartnerSheet(t.name) }),
+            h('p', { class: 'muted small' }, 'Parties jouées dans le même camp : coéquipiers et jeux coopératifs.'),
+          )
+        : null,
+      titles.length > 1 || (titles.length === 1 && titles[0].name !== 'Sans nom')
+        ? h('section', { class: 'card' }, h('h2', { class: 'card-title' }, 'Par jeu'), tallyTable(titles, { label: 'Jeu' }))
+        : null,
+      modes.length > 1 ? h('section', { class: 'card' }, h('h2', { class: 'card-title' }, 'Par mode'), tallyTable(modes, { label: 'Mode' })) : null,
       sizes.length > 1
         ? h(
             'section',
