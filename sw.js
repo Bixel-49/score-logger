@@ -1,6 +1,6 @@
 // Service worker : permet d'utiliser l'application hors connexion.
 // Incrementer VERSION si la liste ASSETS change.
-const VERSION = 'v2';
+const VERSION = 'v2.1';
 const CACHE = `score-logger-${VERSION}`;
 const ASSETS = [
   './',
