@@ -188,7 +188,7 @@ function newEditor(continueFrom = null) {
   return {
     date: base ? base.date : today(),
     location: base ? base.location || '' : '',
-    rows: [emptyRow(continueFrom?.sport || lastSportId())],
+    rows: [{ ...emptyRow(continueFrom?.sport || lastSportId()), owner: continueFrom?.owner || null }],
     active: 0,
     editing: false,
     dirty: false,
@@ -363,7 +363,8 @@ function openSportSheet(sport, onSaved) {
 // Vue "Partie" : saisie des parties d'une journee
 // ---------------------------------------------------------------------------
 
-function openPlayerPicker(title, current, taken, onPick) {
+// clearLabel : texte du bouton qui renvoie '' (retirer le joueur, ou revenir a moi)
+function openPlayerPicker(title, current, taken, onPick, clearLabel = 'Retirer ce joueur') {
   openSheet(title, (close) => {
     let query = '';
     const pick = async (name) => {
@@ -403,7 +404,7 @@ function openPlayerPicker(title, current, taken, onPick) {
     setTimeout(() => search.focus(), 50);
     return {
       body: [search, addBtn, list],
-      actions: current ? [h('button', { class: 'btn danger', onclick: () => pick('') }, 'Retirer ce joueur')] : [],
+      actions: current ? [h('button', { class: 'btn danger', onclick: () => pick('') }, clearLabel)] : [],
     };
   });
 }
@@ -488,7 +489,8 @@ function saveEditor() {
   const check = (r) => {
     const owner = normalize(r.owner || store.getMe());
     const self = r.opponents.some((o) => normalize(o.name.trim()) === owner);
-    return [...validate(r), ...(self ? [`${r.owner || 'Tu'} ne peut pas être son propre adversaire.`] : [])];
+    const message = r.owner ? `${r.owner} ne peut pas être son propre adversaire.` : 'Tu ne peux pas être ton propre adversaire.';
+    return [...validate(r), ...(self ? [message] : [])];
   };
   const errors = records.flatMap((r, i) => check(r).map((msg) => (e.rows.length > 1 ? `Partie ${e.rows.indexOf(rows[i]) + 1} : ${msg}` : msg)));
   if (errors.length) {
@@ -638,7 +640,29 @@ function gameRow(e, row, i, sports, { select, toggleOpponent }) {
     h(
       'div',
       { class: 'prow' },
-      h('div', { class: 'slot me' }, h('span', { class: 'slot-label' }, row.owner ? 'Joueur' : 'Moi'), h('span', { class: 'slot-name' }, row.owner || meLabel())),
+      // Un administrateur peut saisir une partie sans y jouer : il remplace "Moi" par un autre joueur
+      h(
+        store.isAdmin() ? 'button' : 'div',
+        {
+          class: `slot me ${store.isAdmin() ? 'filled' : ''}`,
+          onclick: store.isAdmin()
+            ? () =>
+                openPlayerPicker(
+                  'Joueur principal',
+                  row.owner || '',
+                  taken,
+                  (name) => {
+                    row.owner = name && normalize(name) !== normalize(store.getMe()) ? name : null;
+                    touchEditor();
+                    rerenderKeepScroll();
+                  },
+                  `↩️ Revenir à moi (${meLabel()})`,
+                )
+            : null,
+        },
+        h('span', { class: 'slot-label' }, row.owner ? 'Joueur' : store.isAdmin() ? 'Moi · toucher pour changer' : 'Moi'),
+        h('span', { class: 'slot-name' }, row.owner || meLabel()),
+      ),
       scoreInput(row, 'me', 'moi', refresh),
       h('span', {}),
       row.opponents.map((o, k) => [
@@ -817,7 +841,8 @@ function renderGameView() {
           {
             class: 'btn add-match',
             onclick: () => {
-              e.rows.push(emptyRow(e.rows.at(-1).sport));
+              // Meme sport et meme joueur principal que la partie precedente
+              e.rows.push({ ...emptyRow(e.rows.at(-1).sport), owner: e.rows.at(-1).owner || null });
               e.active = e.rows.length - 1;
               touchEditor();
               rerenderKeepScroll();

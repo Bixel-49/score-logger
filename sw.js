@@ -23,7 +23,8 @@ const ASSETS = [
 const SDK = 'https://www.gstatic.com/firebasejs/';
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));
+  // cache: 'reload' : on telecharge vraiment les fichiers, sans reprendre une copie du cache HTTP
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS.map((url) => new Request(url, { cache: 'reload' })))));
   self.skipWaiting();
 });
 
@@ -61,7 +62,8 @@ self.addEventListener('fetch', (event) => {
   event.respondWith(
     (async () => {
       const cache = await caches.open(CACHE);
-      const network = fetch(request).then((response) => {
+      // no-cache : le navigateur redemande toujours au serveur si le fichier a change
+      const network = fetch(request, { cache: 'no-cache' }).then((response) => {
         if (response.ok) cache.put(request, response.clone());
         return response;
       });
