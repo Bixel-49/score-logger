@@ -1,6 +1,7 @@
 // Service worker : permet d'utiliser l'application hors connexion.
-// Incrementer VERSION si la liste ASSETS change.
-const VERSION = 'v1.0';
+// La version se change dans js/version.js (a chaque mise en ligne, ou si la liste ASSETS change).
+importScripts('./js/version.js');
+const VERSION = self.APP_VERSION;
 const CACHE = `score-logger-${VERSION}`;
 const ASSETS = [
   './',
@@ -11,6 +12,7 @@ const ASSETS = [
   './js/stats.js',
   './js/cloud.js',
   './js/firebase-config.js',
+  './js/version.js',
   './manifest.webmanifest',
   './icons/icon.svg',
   './icons/icon-192.png',

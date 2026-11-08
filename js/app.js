@@ -690,6 +690,9 @@ function gameRow(e, row, i, sports, { select, toggleOpponent }) {
   );
 }
 
+// Version de l'application (js/version.js)
+const versionTag = () => (self.APP_VERSION ? h('span', { class: 'version' }, self.APP_VERSION) : null);
+
 function renderGameView() {
   const e = state.editor;
   const sports = sportsMap();
@@ -698,7 +701,7 @@ function renderGameView() {
     return h(
       'div',
       { class: 'stack' },
-      h('div', { class: 'view-head' }, h('h1', {}, 'Parties du jour')),
+      h('div', { class: 'view-head' }, h('div', {}, h('h1', {}, 'Parties du jour'), versionTag())),
       h(
         'section',
         { class: 'card' },
@@ -761,7 +764,13 @@ function renderGameView() {
     h(
       'div',
       { class: 'view-head' },
-      h('div', {}, h('h1', {}, e.editing ? 'Modifier la partie' : 'Parties du jour'), e.dirty ? h('span', { class: 'pill warn' }, 'Brouillon') : null),
+      h(
+        'div',
+        {},
+        h('h1', {}, e.editing ? 'Modifier la partie' : 'Parties du jour'),
+        e.editing ? null : versionTag(),
+        e.dirty ? h('span', { class: 'pill warn' }, 'Brouillon') : null,
+      ),
       !e.editing && e.dirty ? h('button', { class: 'btn small ghost', onclick: () => confirm('Effacer cette saisie ?') && startNewGame() }, 'Effacer') : null,
     ),
     h(

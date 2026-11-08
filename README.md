@@ -93,7 +93,7 @@ Les données sont dans Firestore. **Réglages → Sauvegarde → Télécharger /
 
 ## Mettre à jour l'app
 
-Modifie les fichiers, puis fais `git commit` et `git push`. Les téléphones récupèrent la nouvelle version à la prochaine ouverture de l'app avec du réseau. Si tu ajoutes ou renommes un fichier, ajoute-le à la liste `ASSETS` de `sw.js` et incrémente `VERSION`. Si tu modifies `firestore.rules`, recopie-le dans la console Firebase.
+Modifie les fichiers, change la version dans `js/version.js` (ex. `v1.0` → `v1.1`), puis fais `git commit` et `git push`. La version s'affiche à côté de « Parties du jour » : elle permet de vérifier qu'un téléphone a bien la dernière. Les téléphones récupèrent la nouvelle version à la prochaine ouverture de l'app avec du réseau. Si tu ajoutes ou renommes un fichier, ajoute-le aussi à la liste `ASSETS` de `sw.js`. Si tu modifies `firestore.rules`, recopie-le dans la console Firebase.
 
 ## Tester sur le PC
 
