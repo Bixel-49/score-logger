@@ -1,4 +1,5 @@
 import * as store from './store.js';
+import * as cloud from './cloud.js';
 import {
   outcome,
   scoreText,
@@ -134,9 +135,16 @@ function persistOrWarn(action) {
     action();
     return true;
   } catch (e) {
-    alert(`Impossible d'enregistrer sur le téléphone (stockage plein ?).\n${e.message}`);
+    alert(e.message);
     return false;
   }
+}
+
+// Erreur renvoyee par Firebase lors d'un envoi
+function cloudError(e) {
+  if (e?.code === 'permission-denied') return 'Action refusée par le serveur : seuls l’auteur d’une partie et ses joueurs peuvent la modifier.';
+  if (e?.code === 'unavailable') return 'Serveur injoignable. Réessaie avec du réseau.';
+  return e?.message || String(e);
 }
 
 // --- Dates (stockees en 'AAAA-MM-JJ', heure locale) ---
@@ -199,6 +207,8 @@ const state = {
   sport: '',
   historyQuery: '',
   historySport: '',
+  historyScope: 'mine', // 'mine' : mes parties ; 'all' : tout le groupe
+  statsPid: '', // joueur dont on regarde les stats ('' = moi)
 };
 
 function touchEditor() {
@@ -212,7 +222,8 @@ const sportLabel = (s) => (s ? `${s.icon} ${s.name}` : '❓ Sport supprimé');
 
 // Joueurs tries par nombre d'apparitions (les habitues en premier)
 function playersByFrequency() {
-  const count = new Map(store.getPlayers().map((n) => [n, 0]));
+  const me = store.getMe();
+  const count = new Map(store.getPlayers().filter((n) => n !== me).map((n) => [n, 0]));
   for (const g of store.getGames()) for (const o of g.opponents) count.set(o.name, (count.get(o.name) || 0) + 1);
   return [...count.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0], 'fr')).map(([n]) => n);
 }
@@ -409,6 +420,7 @@ function rowToRecord(e, row) {
     me: row.me,
     opponents: row.opponents.map((o) => ({ name: o.name.trim(), score: o.score })),
     comments: row.comments || '',
+    owner: row.owner || null,
   };
 }
 
@@ -465,7 +477,12 @@ function saveEditor() {
     return;
   }
   const records = rows.map((row) => rowToRecord(e, row));
-  const errors = records.flatMap((r, i) => validate(r).map((msg) => (e.rows.length > 1 ? `Partie ${e.rows.indexOf(rows[i]) + 1} : ${msg}` : msg)));
+  const check = (r) => {
+    const owner = normalize(r.owner || store.getMe());
+    const self = r.opponents.some((o) => normalize(o.name.trim()) === owner);
+    return [...validate(r), ...(self ? [`${r.owner || 'Tu'} ne peut pas être son propre adversaire.`] : [])];
+  };
+  const errors = records.flatMap((r, i) => check(r).map((msg) => (e.rows.length > 1 ? `Partie ${e.rows.indexOf(rows[i]) + 1} : ${msg}` : msg)));
   if (errors.length) {
     alert(errors.join('\n'));
     return;
@@ -613,7 +630,7 @@ function gameRow(e, row, i, sports, { select, toggleOpponent }) {
     h(
       'div',
       { class: 'prow' },
-      h('div', { class: 'slot me' }, h('span', { class: 'slot-label' }, 'Moi'), h('span', { class: 'slot-name' }, meLabel())),
+      h('div', { class: 'slot me' }, h('span', { class: 'slot-label' }, row.owner ? 'Joueur' : 'Moi'), h('span', { class: 'slot-name' }, row.owner || meLabel())),
       scoreInput(row, 'me', 'moi', refresh),
       h('span', {}),
       row.opponents.map((o, k) => [
@@ -837,12 +854,42 @@ function gameItem(g, sports, onclick) {
   );
 }
 
+// Joueurs du meilleur au moins bon
+function ranking(g, sport) {
+  return [...g.players].sort((a, b) => (sport?.lowerWins ? a.score - b.score : b.score - a.score));
+}
+
+// Partie du groupe a laquelle je n'ai pas participe : vainqueur(s) au lieu de V / N / D
+function groupGameItem(g, sports, onclick) {
+  const sport = sports.get(g.sport);
+  const ranked = ranking(g, sport);
+  const winners = ranked.filter((p) => p.score === ranked[0].score).map((p) => p.name);
+  return h(
+    'button',
+    { class: 'match-item', onclick },
+    h('span', { class: 'result neutral', title: 'Partie du groupe' }, '·'),
+    h(
+      'span',
+      { class: 'match-main' },
+      h('span', { class: 'match-name' }, sportLabel(sport), h('span', { class: 'muted' }, ` · 🏆 ${winners.join(', ')}${winners.length > 1 ? ' (égalité)' : ''}`)),
+      h('span', { class: 'muted' }, g.players.map((p) => p.name).join(' vs ')),
+    ),
+    h('span', { class: 'match-score' }, ranked.map((p) => formatScore(p.score)).join(' · ')),
+  );
+}
+
+// g : partie vue par moi (avec me / opponents) ou partie du groupe (players seulement)
 function openGameActions(g) {
   const sports = sportsMap();
   const sport = sports.get(g.sport);
-  const o = outcome(g, sport);
-  const lines = [{ name: meLabel(), score: g.me, me: true }, ...g.opponents].sort((a, b) => (sport?.lowerWins ? a.score - b.score : b.score - a.score));
-  openSheet(`${sportLabel(sport)} · ${RESULTS[o.result][2]}`, (close) => ({
+  const mine = g.me !== undefined ? g : store.perspective(g, store.myPid());
+  const o = mine ? outcome(mine, sport) : null;
+  const myPid = store.myPid();
+  const lines = ranking(g, sport).map((p) => ({ ...p, me: p.pid === myPid }));
+  const editable = store.canEdit(g);
+  // Un administrateur peut modifier une partie sans y avoir joue : on la saisit du point de vue du premier joueur
+  const editTarget = mine || (editable && g.players.length ? { ...store.perspective(g, g.players[0].pid), owner: g.players[0].name } : null);
+  openSheet(o ? `${sportLabel(sport)} · ${RESULTS[o.result][2]}` : sportLabel(sport), (close) => ({
     body: [
       h(
         'dl',
@@ -850,7 +897,8 @@ function openGameActions(g) {
         h('dt', {}, 'Date'),
         h('dd', {}, longDate(g.date)),
         g.location ? [h('dt', {}, 'Lieu'), h('dd', {}, g.location)] : null,
-        o.size > 2 ? [h('dt', {}, 'Place'), h('dd', {}, placeText(o.rank, o.size))] : null,
+        o && o.size > 2 ? [h('dt', {}, 'Place'), h('dd', {}, placeText(o.rank, o.size))] : null,
+        g.createdByName ? [h('dt', {}, 'Saisie par'), h('dd', {}, g.createdByName)] : null,
       ),
       h(
         'table',
@@ -862,20 +910,25 @@ function openGameActions(g) {
         ),
       ),
       g.comments ? h('p', { class: 'comment' }, g.comments) : null,
+      editable
+        ? null
+        : h('p', { class: 'muted small' }, 'Seuls l’auteur de la partie, ses joueurs et les administrateurs peuvent la modifier ou la supprimer.'),
       h(
         'div',
-        { class: 'menu' },
-        h(
-          'button',
-          {
-            class: 'btn',
-            onclick: async () => {
-              await close();
-              openInEditor(g);
-            },
-          },
-          '✏️ Modifier',
-        ),
+        { class: 'menu', hidden: !editable },
+        editTarget
+          ? h(
+              'button',
+              {
+                class: 'btn',
+                onclick: async () => {
+                  await close();
+                  openInEditor(editTarget);
+                },
+              },
+              '✏️ Modifier',
+            )
+          : null,
         h(
           'button',
           {
@@ -915,30 +968,67 @@ function sportFilter(value, onchange) {
 
 function renderHistoryView() {
   const sports = sportsMap();
-  const all = store.getGames();
+  const group = state.historyScope === 'all';
+  const all = group ? store.getAllGames() : store.getGames();
   const q = normalize(state.historyQuery);
   const filtered = all.filter(
     (g) =>
       (!state.historySport || g.sport === state.historySport) &&
-      (!q || normalize(`${g.opponents.map((o) => o.name).join(' ')} ${g.location || ''} ${g.date} ${sports.get(g.sport)?.name || ''}`).includes(q)),
+      (!q || normalize(`${g.players.map((p) => p.name).join(' ')} ${g.location || ''} ${g.date} ${sports.get(g.sport)?.name || ''}`).includes(q)),
   );
-  const days = byDay(filtered, sports);
 
-  const content = days.length
-    ? days.map((d) =>
+  let content;
+  if (!filtered.length) {
+    content = h('p', { class: 'muted pad' }, all.length ? 'Aucune partie ne correspond à la recherche.' : 'Aucune partie pour l’instant. Saisis ta première partie dans l’onglet Partie.');
+  } else if (group) {
+    // Tout le groupe : mes parties avec V / N / D, les autres avec le vainqueur
+    const myPid = store.myPid();
+    const days = new Map();
+    for (const g of chronological(filtered).reverse()) {
+      if (!days.has(g.date)) days.set(g.date, []);
+      days.get(g.date).push(g);
+    }
+    content = [...days.entries()].map(([date, list]) =>
+      h(
+        'section',
+        { class: 'day' },
+        h('div', { class: 'day-head' }, h('h2', {}, longDate(date)), h('span', { class: 'muted small' }, plural(list.length, 'partie'))),
         h(
-          'section',
-          { class: 'day' },
-          h('div', { class: 'day-head' }, h('h2', {}, longDate(d.date)), dayScore(d)),
-          h('ul', { class: 'match-list' }, d.games.map((g) => h('li', {}, gameItem(g, sports, () => openGameActions(g))))),
+          'ul',
+          { class: 'match-list' },
+          list.map((g) => {
+            const mine = store.perspective(g, myPid);
+            return h('li', {}, mine ? gameItem(mine, sports, () => openGameActions(mine)) : groupGameItem(g, sports, () => openGameActions(g)));
+          }),
         ),
-      )
-    : h('p', { class: 'muted pad' }, all.length ? 'Aucune partie ne correspond à la recherche.' : 'Aucune partie pour l’instant. Saisis ta première partie dans l’onglet Partie.');
+      ),
+    );
+  } else {
+    content = byDay(filtered, sports).map((d) =>
+      h(
+        'section',
+        { class: 'day' },
+        h('div', { class: 'day-head' }, h('h2', {}, longDate(d.date)), dayScore(d)),
+        h('ul', { class: 'match-list' }, d.games.map((g) => h('li', {}, gameItem(g, sports, () => openGameActions(g))))),
+      ),
+    );
+  }
 
   return h(
     'div',
     { class: 'stack' },
     h('div', { class: 'view-head' }, h('h1', {}, 'Historique'), h('span', { class: 'muted' }, plural(all.length, 'partie'))),
+    segmented(
+      [
+        ['mine', 'Mes parties'],
+        ['all', 'Tout le groupe'],
+      ],
+      state.historyScope,
+      (k) => {
+        state.historyScope = k;
+        rerenderKeepScroll();
+      },
+    ),
     all.length
       ? h(
           'div',
@@ -988,7 +1078,32 @@ const PERIODS = {
 // Parties de la periode ; sport = '' pour tous les sports
 function periodGames(sport = state.sport) {
   const from = PERIODS[state.period].from();
-  return store.getGames().filter((g) => g.date >= from && (!sport || g.sport === sport));
+  return store.getGames(statsPid()).filter((g) => g.date >= from && (!sport || g.sport === sport));
+}
+
+// Joueur dont on affiche les stats : moi, ou un autre joueur du groupe
+const statsPid = () => state.statsPid || store.myPid();
+
+function statsPlayerSelect() {
+  const counts = new Map();
+  for (const g of store.getAllGames()) for (const p of g.players) counts.set(p.pid, { name: p.name, n: (counts.get(p.pid)?.n || 0) + 1 });
+  const me = store.myPid();
+  const others = [...counts.entries()].filter(([pid]) => pid !== me).sort((a, b) => a[1].name.localeCompare(b[1].name, 'fr'));
+  if (!others.length) return null;
+  return h(
+    'select',
+    {
+      class: 'input',
+      'aria-label': 'Joueur',
+      onchange: (ev) => {
+        state.statsPid = ev.target.value;
+        state.sport = '';
+        rerenderKeepScroll();
+      },
+    },
+    h('option', { value: '', selected: !state.statsPid }, `👤 Mes stats (${meLabel()})`),
+    others.map(([pid, c]) => h('option', { value: pid, selected: pid === state.statsPid }, `Stats de ${c.name}`)),
+  );
 }
 
 function segmented(options, value, onchange) {
@@ -1092,7 +1207,7 @@ function renderStatsView() {
   const games = periodGames();
   const sum = summary(games, sports);
   const hl = highlights(games, sports);
-  const played = new Set(store.getGames().map((g) => g.sport));
+  const played = new Set(store.getGames(statsPid()).map((g) => g.sport));
   const selectSport = (id) => {
     state.sport = id;
     rerenderKeepScroll();
@@ -1110,7 +1225,7 @@ function renderStatsView() {
 
   let body;
   if (!games.length) {
-    body = h('p', { class: 'muted pad' }, store.getGames().length ? 'Aucune partie sur cette période.' : 'Aucune partie pour l’instant.');
+    body = h('p', { class: 'muted pad' }, store.getGames(statsPid()).length ? 'Aucune partie sur cette période.' : 'Aucune partie pour l’instant.');
   } else {
     const streak = sum.streak.length ? `${sum.streak.length} ${RESULTS[sum.streak.result][1]}` : '–';
     const scores = sport ? scoreStats(games, sport) : null;
@@ -1192,6 +1307,7 @@ function renderStatsView() {
     'div',
     { class: 'stack' },
     h('div', { class: 'view-head' }, h('h1', {}, 'Statistiques')),
+    statsPlayerSelect(),
     sportTabs,
     segmented(
       Object.entries(PERIODS).map(([k, p]) => [k, p.label]),
@@ -1216,17 +1332,168 @@ window.addEventListener('beforeinstallprompt', (e) => {
   if (state.view === 'settings') rerenderKeepScroll();
 });
 
+// Reservee aux administrateurs (e-mails listes dans config/group.admins)
+function adminCard() {
+  const acc = store.account();
+  const members = store.getMembers();
+  const invites = store.getInvites();
+  const linked = store
+    .getPlayerDetails()
+    .filter((p) => p.linked)
+    .map((p) => p.name);
+  let email = '';
+
+  const choosePlayer = (title, current, onPick) =>
+    openPlayerPicker(
+      title,
+      current,
+      linked.filter((n) => n !== current),
+      (name) => name && persistOrWarn(() => onPick(name)) && rerenderKeepScroll(),
+    );
+
+  // Si la personne est deja membre, on la relie directement ; sinon on cree une invitation
+  const assign = () => {
+    const clean = email.trim().toLowerCase();
+    if (!clean) return alert('Saisis une adresse e-mail.');
+    const member = members.find((m) => m.email.toLowerCase() === clean);
+    choosePlayer(`Joueur de ${clean}`, '', (name) => {
+      if (member) store.linkMember(member.uid, name);
+      else store.inviteEmail(clean, name);
+      toast(member ? `${clean} est maintenant « ${name} »` : `Invitation créée : ${clean} → ${name}`);
+    });
+  };
+
+  return h(
+    'section',
+    { class: 'card' },
+    h('h2', { class: 'card-title' }, '🔑 Administration'),
+    h(
+      'dl',
+      { class: 'kv' },
+      h('dt', {}, 'Code du groupe'),
+      h(
+        'dd',
+        {},
+        h('code', {}, acc.code || '–'),
+        ' ',
+        h(
+          'button',
+          {
+            class: 'icon-btn',
+            'aria-label': 'Changer le code du groupe',
+            onclick: () => {
+              const code = prompt('Nouveau code du groupe (les membres actuels restent membres) :', acc.code);
+              if (code && code.trim() !== acc.code && persistOrWarn(() => store.setGroupCode(code))) toast('Code modifié');
+            },
+          },
+          '✏️',
+        ),
+      ),
+    ),
+
+    h('h3', { class: 'sub-title' }, 'Membres'),
+    h(
+      'ul',
+      { class: 'player-list' },
+      members.map((m) =>
+        h(
+          'li',
+          {},
+          h(
+            'span',
+            { class: 'member' },
+            h('strong', {}, m.playerName || 'Pas encore de joueur'),
+            m.revoked ? h('span', { class: 'pill warn' }, 'Révoqué') : null,
+            h('span', { class: 'muted small' }, m.email),
+          ),
+          h('button', { class: 'icon-btn', 'aria-label': `Changer le joueur de ${m.email}`, onclick: () => choosePlayer(`Joueur de ${m.email}`, m.playerName, (name) => store.linkMember(m.uid, name)) }, '👤'),
+          m.me
+            ? null
+            : h(
+                'button',
+                {
+                  class: 'icon-btn',
+                  'aria-label': m.revoked ? `Rétablir ${m.email}` : `Révoquer ${m.email}`,
+                  title: m.revoked ? 'Rétablir l’accès' : 'Révoquer l’accès',
+                  onclick: () => {
+                    const question = m.revoked
+                      ? `Rétablir l’accès de ${m.email} ?`
+                      : `Révoquer l’accès de ${m.email} ?\nCette personne ne pourra plus voir ni saisir de parties. Ses parties restent dans l’historique.`;
+                    if (confirm(question) && persistOrWarn(() => store.setRevoked(m.uid, !m.revoked))) toast(m.revoked ? 'Accès rétabli' : 'Accès révoqué');
+                  },
+                },
+                m.revoked ? '↩️' : '🚫',
+              ),
+        ),
+      ),
+    ),
+
+    h('h3', { class: 'sub-title' }, 'Attribuer un joueur à un e-mail'),
+    h('p', { class: 'muted small' }, 'La personne pourra entrer sans le code du groupe et sera directement reliée à ce joueur.'),
+    h(
+      'div',
+      { class: 'add-player' },
+      h('input', {
+        class: 'input',
+        type: 'email',
+        placeholder: 'prenom.nom@gmail.com',
+        autocomplete: 'off',
+        oninput: (e) => (email = e.target.value),
+        onkeydown: (e) => e.key === 'Enter' && assign(),
+      }),
+      h('button', { class: 'btn primary', onclick: assign }, 'Choisir le joueur'),
+    ),
+    invites.length
+      ? h(
+          'ul',
+          { class: 'player-list' },
+          invites.map((i) =>
+            h(
+              'li',
+              {},
+              h('span', { class: 'member' }, h('strong', {}, i.playerName), h('span', { class: 'muted small' }, `${i.email}${i.joined ? ' · inscrit' : ' · en attente'}`)),
+              h(
+                'button',
+                {
+                  class: 'icon-btn',
+                  'aria-label': `Supprimer l’invitation de ${i.email}`,
+                  onclick: () => confirm(`Supprimer l’invitation de ${i.email} ?`) && persistOrWarn(() => store.removeInvite(i.email)),
+                },
+                '🗑️',
+              ),
+            ),
+          ),
+        )
+      : null,
+  );
+}
+
 function renderSettingsView() {
-  const games = store.getGames();
+  const games = store.getAllGames();
   const sports = store.getSports();
   const usedSports = new Set(games.map((g) => g.sport));
-  const players = store.getPlayers();
-  const usedPlayers = new Set(games.flatMap((g) => g.opponents.map((o) => o.name)));
+  const players = store.getPlayerDetails();
+  const usedPlayers = new Set(games.flatMap((g) => g.players.map((p) => p.pid)));
+  const acc = store.account();
+  const legacy = store.legacyBackup();
   let newPlayer = '';
 
   const addPlayer = () => {
     if (!newPlayer.trim()) return;
     if (persistOrWarn(() => store.addPlayer(newPlayer))) rerenderKeepScroll();
+  };
+
+  const runImport = async (backup) => {
+    toast('Import en cours…');
+    try {
+      const res = await store.importLegacy(backup);
+      rerenderKeepScroll();
+      toast(`${plural(res.added, 'partie')} ajoutée${res.added > 1 ? 's' : ''}, ${res.updated} mise(s) à jour${res.ignored ? `, ${res.ignored} ignorée(s)` : ''}`);
+      return true;
+    } catch (err) {
+      alert(`Import impossible : ${cloudError(err)}`);
+      return false;
+    }
   };
 
   const backupInput = h('input', {
@@ -1238,14 +1505,14 @@ function renderSettingsView() {
       e.target.value = '';
       if (!file) return;
       try {
-        const res = store.importBackup(JSON.parse(await file.text()));
-        rerenderKeepScroll();
-        toast(`${plural(res.added, 'partie')} ajoutée${res.added > 1 ? 's' : ''}, ${res.updated} mise(s) à jour${res.ignored ? `, ${res.ignored} ignorée(s)` : ''}`);
+        await runImport(JSON.parse(await file.text()));
       } catch (err) {
-        alert(`Import impossible : ${err.message}`);
+        alert(`Fichier illisible : ${err.message}`);
       }
     },
   });
+
+  const inviteText = `Rejoins le groupe Score Logger : ${location.href.split('#')[0]}\nConnecte-toi avec Google puis saisis le code du groupe : ${acc.code}`;
 
   return h(
     'div',
@@ -1274,20 +1541,75 @@ function renderSettingsView() {
     h(
       'section',
       { class: 'card' },
-      field(
-        'Mon prénom',
-        h('input', {
-          class: 'input',
-          placeholder: 'Moi',
-          value: store.getMe(),
-          onchange: (e) => persistOrWarn(() => store.setMe(e.target.value)) && toast('Prénom enregistré'),
-        }),
+      h('h2', { class: 'card-title' }, 'Mon compte'),
+      h(
+        'dl',
+        { class: 'kv' },
+        h('dt', {}, 'Compte'),
+        h('dd', {}, acc.email || acc.name),
+        h('dt', {}, 'Mon joueur'),
+        h(
+          'dd',
+          {},
+          meLabel(),
+          ' ',
+          h(
+            'button',
+            {
+              class: 'icon-btn',
+              'aria-label': 'Changer mon nom de joueur',
+              onclick: () => {
+                const to = prompt('Ton nom de joueur :', store.getMe());
+                if (to && to.trim() !== store.getMe() && persistOrWarn(() => store.renamePlayer(store.getMe(), to))) {
+                  rerenderKeepScroll();
+                  toast('Nom modifié');
+                }
+              },
+            },
+            '✏️',
+          ),
+        ),
+        acc.code ? [h('dt', {}, 'Code du groupe'), h('dd', {}, h('code', {}, acc.code))] : null,
+      ),
+      h(
+        'div',
+        { class: 'row wrap' },
+        acc.code
+          ? h(
+              'button',
+              {
+                class: 'btn',
+                onclick: async () => {
+                  try {
+                    if (navigator.share) await navigator.share({ text: inviteText });
+                    else {
+                      await navigator.clipboard.writeText(inviteText);
+                      toast('Invitation copiée');
+                    }
+                  } catch (e) {
+                    if (e.name !== 'AbortError') prompt('Copie ce message :', inviteText);
+                  }
+                },
+              },
+              '📤 Inviter quelqu’un',
+            )
+          : null,
+        h(
+          'button',
+          {
+            class: 'btn',
+            onclick: () => confirm('Se déconnecter de ce téléphone ?') && cloud.signOut(),
+          },
+          '🚪 Se déconnecter',
+        ),
       ),
     ),
+    store.isAdmin() ? adminCard() : null,
     h(
       'section',
       { class: 'card' },
       h('div', { class: 'row between' }, h('h2', { class: 'card-title' }, 'Sports et jeux'), h('button', { class: 'btn small primary', onclick: () => openSportSheet(null, rerenderKeepScroll) }, '➕ Ajouter')),
+      h('p', { class: 'muted small' }, 'Partagés par tout le groupe.'),
       sports.length
         ? h(
             'ul',
@@ -1320,6 +1642,7 @@ function renderSettingsView() {
       'section',
       { class: 'card' },
       h('h2', { class: 'card-title' }, 'Joueurs'),
+      h('p', { class: 'muted small' }, '👤 = relié à un compte : ce joueur saisit ses propres parties. Lui seul peut changer son nom.'),
       h(
         'div',
         { class: 'add-player' },
@@ -1335,19 +1658,20 @@ function renderSettingsView() {
         ? h(
             'ul',
             { class: 'player-list' },
-            players.map((name) =>
+            players.map((p) =>
               h(
                 'li',
                 {},
-                h('span', {}, name),
+                h('span', {}, p.linked ? '👤 ' : '', p.mine ? h('strong', {}, p.name) : p.name),
                 h(
                   'button',
                   {
                     class: 'icon-btn',
-                    'aria-label': `Renommer ${name}`,
+                    'aria-label': `Renommer ${p.name}`,
+                    disabled: p.linked && !p.mine && !store.isAdmin(),
                     onclick: () => {
-                      const to = prompt(`Nouveau nom pour « ${name} » (un nom existant fusionne les deux joueurs) :`, name);
-                      if (to && to.trim() !== name && persistOrWarn(() => store.renamePlayer(name, to))) {
+                      const to = prompt(`Nouveau nom pour « ${p.name} » (un nom existant fusionne les deux joueurs) :`, p.name);
+                      if (to && to.trim() !== p.name && persistOrWarn(() => store.renamePlayer(p.name, to))) {
                         rerenderKeepScroll();
                         toast('Joueur renommé');
                       }
@@ -1359,11 +1683,11 @@ function renderSettingsView() {
                   'button',
                   {
                     class: 'icon-btn',
-                    'aria-label': `Supprimer ${name}`,
-                    disabled: usedPlayers.has(name),
-                    title: usedPlayers.has(name) ? 'Joueur présent dans des parties' : null,
+                    'aria-label': `Supprimer ${p.name}`,
+                    disabled: p.linked || usedPlayers.has(p.pid),
+                    title: p.linked ? 'Joueur relié à un compte' : usedPlayers.has(p.pid) ? 'Joueur présent dans des parties' : null,
                     onclick: () => {
-                      if (confirm(`Retirer « ${name} » de la liste ?`) && persistOrWarn(() => store.removePlayer(name))) rerenderKeepScroll();
+                      if (confirm(`Retirer « ${p.name} » de la liste ?`) && persistOrWarn(() => store.removePlayer(p.name))) rerenderKeepScroll();
                     },
                   },
                   '🗑️',
@@ -1377,44 +1701,318 @@ function renderSettingsView() {
       'section',
       { class: 'card' },
       h('h2', { class: 'card-title' }, 'Sauvegarde'),
-      h('p', { class: 'muted' }, 'Les parties sont stockées uniquement sur ce téléphone. Exporte-les régulièrement : effacer les données de Chrome les supprimerait.'),
+      h('p', { class: 'muted' }, 'Les parties sont enregistrées en ligne et partagées par le groupe. Ce téléphone en garde une copie pour fonctionner hors connexion.'),
+      legacy
+        ? h(
+            'div',
+            { class: 'notice' },
+            h('p', {}, `${plural(legacy.games.length, 'ancienne partie')} enregistrée${legacy.games.length > 1 ? 's' : ''} uniquement sur ce téléphone.`),
+            h(
+              'button',
+              {
+                class: 'btn primary small',
+                onclick: async () => {
+                  if (await runImport(legacy)) {
+                    store.markMigrated();
+                    rerenderKeepScroll();
+                  }
+                },
+              },
+              'Envoyer au groupe',
+            ),
+          )
+        : null,
       backupInput,
       h(
         'div',
         { class: 'row wrap' },
-        exportButtons(`scores-${today()}.json`, () => new Blob([JSON.stringify(store.exportBackup(), null, 2)], { type: 'application/json' })),
-        h('button', { class: 'btn', onclick: () => backupInput.click() }, '📥 Importer'),
+        exportButtons(`scores-groupe-${today()}.json`, () => new Blob([JSON.stringify(store.exportBackup(), null, 2)], { type: 'application/json' })),
+        h('button', { class: 'btn', onclick: () => backupInput.click() }, '📥 Importer mes parties'),
       ),
-      h(
-        'button',
-        {
-          class: 'btn danger',
-          onclick: () => {
-            if (!confirm('Effacer TOUTES les parties, sports et joueurs de ce téléphone ?')) return;
-            if (!confirm('Vraiment ? Cette action est définitive.')) return;
-            store.clearAll();
-            state.editor = newEditor();
-            render();
-            toast('Données effacées');
-          },
-        },
-        '🗑️ Tout effacer',
-      ),
+      h('p', { class: 'muted small' }, 'Importer : un fichier exporté par l’ancienne version de l’application, où « Moi » devient ton joueur.'),
     ),
-    h('p', { class: 'muted small center' }, 'Score Logger · version mobile'),
+    h('p', { class: 'muted small center' }, 'Score Logger · version partagée'),
   );
 }
 
 // ---------------------------------------------------------------------------
-// Demarrage
+// Demarrage : connexion Google, code du groupe, choix de son joueur
 // ---------------------------------------------------------------------------
 
-buildTabbar();
-render();
+const boot = { user: undefined, member: undefined, synced: false, appShown: false, screen: '' };
+let stopMember = null;
+let stopSync = null;
 
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('./sw.js').catch(() => {});
+function showTabbar(visible) {
+  document.getElementById('tabbar').hidden = !visible;
 }
+
+// Ecran plein (avant l'application). key evite de redessiner un ecran deja affiche (saisie en cours).
+function gate(key, build) {
+  if (boot.screen === key) return;
+  boot.screen = key;
+  boot.appShown = false;
+  showTabbar(false);
+  document.getElementById('view').replaceChildren(h('div', { class: 'stack gate' }, h('div', { class: 'gate-logo', 'aria-hidden': 'true' }, '🏆'), build()));
+}
+
+const loading = (text) => gate(`loading:${text}`, () => h('p', { class: 'muted center' }, text));
+
+function setupScreen() {
+  gate('setup', () =>
+    h(
+      'section',
+      { class: 'card' },
+      h('h1', {}, 'Score Logger'),
+      h('p', {}, 'Firebase n’est pas encore configuré.'),
+      h('p', { class: 'muted' }, 'Remplis le fichier js/firebase-config.js avec la configuration de ton projet Firebase (voir le README).'),
+    ),
+  );
+}
+
+function loginScreen() {
+  gate('login', () =>
+    h(
+      'section',
+      { class: 'card' },
+      h('h1', {}, 'Score Logger'),
+      h('p', {}, 'Les scores de tous nos sports et jeux, partagés par le groupe.'),
+      h(
+        'button',
+        {
+          class: 'btn primary',
+          onclick: async (ev) => {
+            const btn = ev.currentTarget;
+            btn.disabled = true;
+            try {
+              await cloud.signIn();
+            } catch (e) {
+              alert(`Connexion impossible : ${e.message}`);
+            }
+            btn.disabled = false;
+          },
+        },
+        'Se connecter avec Google',
+      ),
+    ),
+  );
+}
+
+function joinScreen() {
+  gate('join', () => {
+    let code = '';
+    const join = async (ev) => {
+      if (!code.trim()) return;
+      const btn = ev.currentTarget;
+      btn.disabled = true;
+      try {
+        await store.joinGroup(code);
+      } catch (e) {
+        alert(e?.code === 'permission-denied' ? 'Code incorrect.' : cloudError(e));
+        btn.disabled = false;
+      }
+    };
+    const button = h('button', { class: 'btn primary', onclick: join }, 'Rejoindre le groupe');
+    return h(
+      'section',
+      { class: 'card' },
+      h('h1', {}, `Bonjour ${boot.user.displayName?.split(' ')[0] || ''} !`),
+      h('p', {}, 'Saisis le code du groupe. Demande-le à un membre (Réglages → Inviter quelqu’un).'),
+      field('Code du groupe', h('input', { class: 'input', autocomplete: 'off', oninput: (e) => (code = e.target.value), onkeydown: (e) => e.key === 'Enter' && button.click() })),
+      button,
+      h('button', { class: 'btn ghost small', onclick: () => cloud.signOut() }, 'Changer de compte'),
+    );
+  });
+}
+
+function whoAmIScreen() {
+  gate('who', () => {
+    const free = store.unclaimedPlayers();
+    const suggested = normalize(store.legacyName() || boot.user.displayName?.split(' ')[0] || '');
+    let name = store.legacyName() || boot.user.displayName || '';
+    const act = async (btn, action) => {
+      btn.disabled = true;
+      try {
+        await action();
+      } catch (e) {
+        alert(cloudError(e));
+        btn.disabled = false;
+      }
+    };
+    return h(
+      'section',
+      { class: 'card' },
+      h('h1', {}, 'Qui es-tu ?'),
+      free.length
+        ? [
+            h('p', { class: 'muted' }, 'Si d’autres ont déjà saisi des parties contre toi, choisis ton nom : ces parties deviennent les tiennes.'),
+            h(
+              'div',
+              { class: 'pchips' },
+              free.map((p) =>
+                h(
+                  'button',
+                  {
+                    class: `pchip ${normalize(p.name) === suggested ? 'opponent' : ''}`,
+                    onclick: (ev) => confirm(`Tu es « ${p.name} » ?`) && act(ev.currentTarget, () => store.claimPlayer(p.pid)),
+                  },
+                  p.name,
+                ),
+              ),
+            ),
+            h('p', { class: 'muted' }, 'Sinon, crée ton joueur :'),
+          ]
+        : h('p', { class: 'muted' }, 'Choisis le nom sous lequel les autres te verront.'),
+      field('Mon nom de joueur', h('input', { class: 'input', value: name, oninput: (e) => (name = e.target.value) })),
+      h('button', { class: 'btn primary', onclick: (ev) => act(ev.currentTarget, () => store.createMyPlayer(name)) }, 'Créer mon joueur'),
+    );
+  });
+}
+
+async function showApp() {
+  if (boot.appShown) return rerenderKeepScroll();
+  boot.appShown = true;
+  boot.screen = '';
+  showTabbar(true);
+  // Les sports et parties viennent d'arriver : la saisie reprend le dernier sport joue
+  if (!state.editor.dirty && !state.editor.editing) state.editor = newEditor();
+  render();
+  const legacy = store.legacyBackup();
+  if (legacy && confirm(`${plural(legacy.games.length, 'partie')} sont enregistrées uniquement sur ce téléphone. Les envoyer au groupe maintenant ?`)) {
+    toast('Import en cours…');
+    try {
+      const res = await store.importLegacy(legacy);
+      store.markMigrated();
+      toast(`${plural(res.added, 'partie')} envoyée${res.added > 1 ? 's' : ''} au groupe`);
+    } catch (e) {
+      alert(`Import impossible : ${cloudError(e)}\nTu pourras réessayer depuis Réglages → Sauvegarde.`);
+    }
+    rerenderKeepScroll();
+  }
+}
+
+// Choisit l'ecran a afficher selon l'etat de connexion
+function route() {
+  if (boot.user === null) return loginScreen();
+  if (boot.user === undefined || boot.member === undefined) return loading('Connexion…');
+  if (boot.member === null) {
+    // Invite par e-mail ou administrateur : on entre sans code
+    if (boot.autoJoin === undefined) {
+      boot.autoJoin = 'checking';
+      store
+        .canJoinWithoutCode()
+        .then((ok) => (ok ? store.joinGroup('') : Promise.reject(null)))
+        .catch(() => {
+          boot.autoJoin = false;
+          route();
+        });
+    }
+    return boot.autoJoin === 'checking' ? loading('Connexion…') : joinScreen();
+  }
+  if (boot.member.revoked) return revokedScreen();
+  if (!boot.synced) return loading('Chargement des parties…');
+  if (!boot.member.pid) {
+    // Joueur attribue a mon e-mail par un administrateur : relie automatiquement
+    const assigned = store.assignedPlayer();
+    if (assigned && !boot.autoClaim) {
+      boot.autoClaim = true;
+      store.claimPlayer(assigned.pid).catch(() => whoAmIScreen());
+      return loading(`Bienvenue ${assigned.name} !`);
+    }
+    return whoAmIScreen();
+  }
+  return showApp();
+}
+
+function revokedScreen() {
+  gate('revoked', () =>
+    h(
+      'section',
+      { class: 'card' },
+      h('h1', {}, 'Accès retiré'),
+      h('p', {}, 'Ton accès au groupe a été retiré par un administrateur.'),
+      h('button', { class: 'btn', onclick: () => cloud.signOut() }, 'Changer de compte'),
+    ),
+  );
+}
+
+// Donnees modifiees (par moi ou par un autre membre) : on redessine,
+// mais pas pendant qu'un champ est en cours de saisie.
+let renderQueued = false;
+function onDataChange() {
+  if (!boot.appShown) {
+    boot.screen = '';
+    return route();
+  }
+  if (renderQueued) return;
+  renderQueued = true;
+  const run = () => {
+    const active = document.activeElement;
+    if (active && active.closest?.('#view') && active.matches('input, select, textarea')) {
+      active.addEventListener('blur', () => setTimeout(run, 0), { once: true });
+      return;
+    }
+    renderQueued = false;
+    if (boot.appShown) rerenderKeepScroll();
+  };
+  requestAnimationFrame(run);
+}
+
+async function start() {
+  buildTabbar();
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+  if (!cloud.isConfigured()) return setupScreen();
+  loading('Chargement…');
+  try {
+    await cloud.init();
+  } catch {
+    gate('offline', () =>
+      h(
+        'section',
+        { class: 'card' },
+        h('p', {}, 'Impossible de charger l’application. Une connexion internet est nécessaire au premier lancement.'),
+        h('button', { class: 'btn primary', onclick: () => location.reload() }, 'Réessayer'),
+      ),
+    );
+    return;
+  }
+  store.setHandlers({ change: onDataChange, error: (e) => toast(cloudError(e)) });
+
+  cloud.onUser((user) => {
+    stopMember?.();
+    stopSync?.();
+    stopMember = stopSync = null;
+    Object.assign(boot, { user: user || null, member: undefined, synced: false, autoJoin: undefined, autoClaim: false });
+    state.statsPid = '';
+    store.setSession(user, null);
+    if (!user) return route();
+    stopMember = store.watchMember(
+      user.uid,
+      (member) => {
+        boot.member = member;
+        store.setSession(user, member);
+        if (member?.revoked && stopSync) {
+          stopSync();
+          stopSync = null;
+          boot.synced = false;
+          boot.appShown = false;
+        }
+        if (member && !member.revoked && !stopSync) {
+          stopSync = store.startSync(() => {
+            boot.synced = true;
+            route();
+          });
+        }
+        if (boot.appShown) onDataChange();
+        else route();
+      },
+      (e) => toast(cloudError(e)),
+    );
+    route();
+  });
+}
+
+start();
 
 // Exposes pour le debogage dans la console
 window.scoreLogger = { store, state };

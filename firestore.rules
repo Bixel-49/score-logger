@@ -1,0 +1,108 @@
+rules_version = '2';
+
+// Regles de securite de Score Logger. A copier dans la console Firebase :
+// Firestore Database > Regles > coller ce fichier > Publier.
+//
+// Document config/group (cree a la main dans la console) :
+//   code   : code du groupe, pour entrer sans invitation
+//   admins : liste des e-mails administrateurs
+//
+// - Seuls les membres non revoques lisent et ecrivent.
+// - On devient membre avec le code du groupe, ou sans code si un administrateur
+//   a cree une invitation pour son e-mail (invites/{e-mail}).
+// - Une partie ne peut etre modifiee ou supprimee que par son auteur, ses joueurs ou un administrateur.
+// - Un joueur relie a un compte ne peut etre renomme que par ce compte ou un administrateur.
+// - Un joueur attribue a un e-mail ne peut etre revendique que par ce compte.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+    function myEmail() {
+      return request.auth.token.email;
+    }
+    function cfg() {
+      return get(/databases/$(database)/documents/config/group).data;
+    }
+    function isAdmin() {
+      return signedIn() && request.auth.token.email_verified == true
+        && myEmail() in cfg().get('admins', []);
+    }
+    function memberPath() {
+      return /databases/$(database)/documents/members/$(request.auth.uid);
+    }
+    function isMember() {
+      return signedIn() && exists(memberPath()) && get(memberPath()).data.get('revoked', false) != true;
+    }
+    function myPid() {
+      return get(memberPath()).data.pid;
+    }
+    function invited() {
+      return signedIn() && exists(/databases/$(database)/documents/invites/$(myEmail()));
+    }
+    function participant(game) {
+      return myPid() != null && myPid() in game.pids;
+    }
+
+    match /config/{doc} {
+      allow read: if isMember() || isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // Invitation : e-mail -> joueur attribue
+    match /invites/{email} {
+      allow read: if isMember() || isAdmin() || (signedIn() && email == myEmail());
+      allow write: if isAdmin();
+    }
+
+    match /members/{uid} {
+      allow read: if isMember() || isAdmin() || (signedIn() && request.auth.uid == uid);
+      allow create: if signedIn() && request.auth.uid == uid
+        && request.resource.data.pid == null
+        && request.resource.data.get('revoked', false) == false
+        && ((request.resource.data.code != '' && request.resource.data.code == cfg().code) || invited() || isAdmin());
+      // Un membre ne change que son joueur, et seulement vers un joueur qui lui est attribue dans la meme ecriture.
+      // L'administrateur peut tout modifier (revoquer, changer le joueur d'un membre).
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == uid
+        && resource.data.get('revoked', false) != true
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['pid'])
+        && (request.resource.data.pid == null
+          || getAfter(/databases/$(database)/documents/players/$(request.resource.data.pid)).data.uid == uid));
+      allow delete: if isAdmin();
+    }
+
+    match /sports/{id} {
+      allow read: if isMember();
+      allow create, update: if isMember() && request.resource.data.name is string;
+      allow delete: if isMember();
+    }
+
+    match /players/{id} {
+      allow read: if isMember();
+      allow create: if isAdmin() || (isMember() && request.resource.data.name is string
+        && request.resource.data.uid in [null, request.auth.uid]
+        && request.resource.data.get('email', null) == null);
+      allow update: if isAdmin() || (isMember()
+        && request.resource.data.uid in [null, request.auth.uid]
+        && (resource.data.uid == null || resource.data.uid == request.auth.uid)
+        && request.resource.data.get('email', null) == resource.data.get('email', null)
+        // revendiquer un joueur attribue a un autre e-mail est interdit
+        && (resource.data.uid == request.auth.uid || request.resource.data.uid == null
+          || resource.data.get('email', null) in [null, myEmail()]));
+      allow delete: if isAdmin() || (isMember() && resource.data.uid == null);
+    }
+
+    match /games/{id} {
+      allow read: if isMember();
+      allow create: if isMember()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.pids is list
+        && (participant(request.resource.data) || isAdmin());
+      allow update: if (isAdmin() || (isMember() && (resource.data.createdBy == request.auth.uid || participant(resource.data))))
+        && request.resource.data.createdBy == resource.data.createdBy
+        && request.resource.data.pids is list;
+      allow delete: if isAdmin()
+        || (isMember() && (resource.data.createdBy == request.auth.uid || participant(resource.data)));
+    }
+  }
+}
