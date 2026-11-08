@@ -1436,19 +1436,43 @@ td.bad-text {
   gap: 8px;
 }
 
+/* Joueur dans une equipe : nom sur une ligne, bouton ✕ a droite */
 .team-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding-right: 4px;
+  flex-direction: row;
+  gap: 2px;
+  padding: 4px 4px 4px 14px;
+  max-width: 100%;
+  cursor: default;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.team.mine .team-chip {
+  background: color-mix(in srgb, var(--primary) 10%, var(--surface));
+  border-color: color-mix(in srgb, var(--primary) 35%, var(--border));
+}
+
+.team-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .chip-x {
+  flex: none;
   border: none;
+  border-radius: 99px;
   background: none;
-  color: inherit;
+  color: var(--muted);
   font-size: 0.85rem;
-  min-width: 32px;
-  min-height: 32px;
+  width: 32px;
+  height: 32px;
   cursor: pointer;
+}
+
+.chip-x:hover,
+.chip-x:focus-visible {
+  background: var(--surface-2);
+  color: var(--text);
 }

@@ -764,8 +764,8 @@ function ownerSlot(e, row, taken) {
 function memberChip(row, name) {
   return h(
     'span',
-    { class: 'pchip opponent team-chip' },
-    h('span', {}, name),
+    { class: 'pchip team-chip' },
+    h('span', { class: 'team-chip-name' }, name),
     h(
       'button',
       {
