@@ -298,6 +298,8 @@ const VIEWS = {
 };
 
 function go(view) {
+  // En quittant l'historique, les nouvelles parties sont considerees comme vues
+  if (state.view === 'history' && view !== 'history') store.setPref('unseenGames', []);
   state.view = view;
   render();
   window.scrollTo(0, 0);
@@ -310,6 +312,7 @@ function render() {
     if (btn.dataset.view === state.view) btn.setAttribute('aria-current', 'page');
     else btn.removeAttribute('aria-current');
   }
+  updateHistoryBadge();
 }
 
 function rerenderKeepScroll() {
@@ -1466,7 +1469,7 @@ function renderHistoryView() {
           { class: 'match-list' },
           list.map((g) => {
             const mine = store.perspective(g, myKey);
-            return h('li', {}, mine ? gameItem(mine, sports, () => openGameActions(mine)) : groupGameItem(g, sports, () => openGameActions(g)));
+            return h('li', { class: isUnseen(g) ? 'unseen' : null }, mine ? gameItem(mine, sports, () => openGameActions(mine)) : groupGameItem(g, sports, () => openGameActions(g)));
           }),
         ),
       ),
@@ -1477,7 +1480,7 @@ function renderHistoryView() {
         'section',
         { class: 'day' },
         h('div', { class: 'day-head' }, h('h2', {}, longDate(d.date)), dayScore(d)),
-        h('ul', { class: 'match-list' }, d.games.map((g) => h('li', {}, gameItem(g, sports, () => openGameActions(g))))),
+        h('ul', { class: 'match-list' }, d.games.map((g) => h('li', { class: isUnseen(g) ? 'unseen' : null }, gameItem(g, sports, () => openGameActions(g))))),
       ),
     );
   }
@@ -2269,6 +2272,7 @@ function renderSettingsView() {
         h('button', { class: 'btn', onclick: () => confirm('Se déconnecter de ce téléphone ?') && cloud.signOut() }, '🚪 Se déconnecter'),
       ),
     ),
+    notificationsCard(),
     store.isAdmin() ? adminCard() : null,
     h(
       'section',
@@ -2604,6 +2608,135 @@ function whoAmIScreen(group) {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Notifications : parties ajoutees par les autres membres dans mes groupes.
+// Sans serveur : la notification part de l'application quand elle est ouverte ou en arriere-plan,
+// et les parties ajoutees pendant qu'elle etait fermee sont signalees a la reouverture.
+// ---------------------------------------------------------------------------
+
+const gameRef = (g) => `${g.group}/${g.id}`;
+const notifySupported = () => 'Notification' in window && 'serviceWorker' in navigator;
+const notifyOn = () => notifySupported() && Notification.permission === 'granted' && store.getPref('notify', false);
+
+// Parties deja connues de cet appareil, par groupe : { gid: [id, ...] }
+function checkNewGames() {
+  if (!boot.synced || !boot.user) return;
+  const myGroups = store.getGroups().filter((g) => g.mine);
+  const known = store.getPref('knownGames', null);
+  const next = {};
+  const fresh = [];
+  for (const group of myGroups) {
+    const games = store.getAllGames(group.id);
+    next[group.id] = games.map((g) => g.id);
+    // Groupe jamais vu sur cet appareil (premier lancement, groupe rejoint) : pas de notification pour l'existant
+    if (!known?.[group.id]) continue;
+    const seen = new Set(known[group.id]);
+    for (const g of games) if (!seen.has(g.id) && g.createdBy !== boot.user.uid) fresh.push({ ...g, groupName: group.name });
+  }
+  store.setPref('knownGames', next);
+  // Parties supprimees entre-temps : on les retire de la pastille
+  const existing = new Set(Object.entries(next).flatMap(([gid, ids]) => ids.map((id) => `${gid}/${id}`)));
+  const before = store.getPref('unseenGames', []);
+  const unseen = new Set(before.filter((ref) => existing.has(ref)));
+  if (!fresh.length) {
+    if (unseen.size !== before.length) {
+      store.setPref('unseenGames', [...unseen]);
+      updateHistoryBadge();
+    }
+    return;
+  }
+  fresh.forEach((g) => unseen.add(gameRef(g)));
+  store.setPref('unseenGames', [...unseen]);
+  updateHistoryBadge();
+  announce(fresh);
+}
+
+// Une ligne de resume : "Paul · 🎲 Jeu de société · Catan · 🏆 Julie"
+function gameSummary(g) {
+  const sport = sportsMap().get(g.sport);
+  const mode = modeOf(g);
+  let outcomeText;
+  if (mode === 'coop') outcomeText = g.result === 'W' ? '🏆 gagné ensemble' : '💀 perdu ensemble';
+  else {
+    const list = sides(g, sport);
+    const winners = list.filter((sd) => sd.score === list[0].score).map(sideName);
+    outcomeText = `🏆 ${winners.join(', ')}`;
+  }
+  return `${gameLabel(g, sport)} · ${outcomeText}`;
+}
+
+function announce(fresh) {
+  const groups = [...new Set(fresh.map((g) => g.groupName))];
+  const title = fresh.length === 1 ? `Nouvelle partie · ${groups[0]}` : `${fresh.length} nouvelles parties${groups.length === 1 ? ` · ${groups[0]}` : ''}`;
+  const body =
+    fresh.length === 1
+      ? `${fresh[0].createdByName ? `${fresh[0].createdByName} : ` : ''}${gameSummary(fresh[0])}`
+      : fresh
+          .slice(0, 4)
+          .map(gameSummary)
+          .join('\n') + (fresh.length > 4 ? '\n…' : '');
+  // Application a l'ecran : un simple message suffit
+  if (document.visibilityState === 'visible' || !notifyOn()) {
+    if (document.visibilityState === 'visible') toast(`🔔 ${title}`);
+    return;
+  }
+  navigator.serviceWorker.ready
+    .then((reg) => reg.showNotification(title, { body, icon: 'icons/icon-192.png', badge: 'icons/icon-192.png', tag: 'new-games', renotify: true, data: { view: 'history' } }))
+    .catch(() => {});
+}
+
+// Pastille sur l'onglet Historique : parties des autres pas encore vues
+function updateHistoryBadge() {
+  const btn = document.querySelector('.tabbar button[data-view="history"]');
+  if (!btn) return;
+  const count = store.getPref('unseenGames', []).length;
+  let badge = btn.querySelector('.tab-badge');
+  if (!count) return badge?.remove();
+  if (!badge) {
+    badge = h('span', { class: 'tab-badge' });
+    btn.append(badge);
+  }
+  badge.textContent = count > 9 ? '9+' : String(count);
+  badge.setAttribute('aria-label', `${count} nouvelle${count > 1 ? 's' : ''} partie${count > 1 ? 's' : ''}`);
+}
+
+const isUnseen = (g) => store.getPref('unseenGames', []).includes(gameRef(g));
+
+async function enableNotifications() {
+  const permission = await Notification.requestPermission();
+  store.setPref('notify', permission === 'granted');
+  if (permission === 'granted') toast('🔔 Notifications activées');
+  rerenderKeepScroll();
+}
+
+function notificationsCard() {
+  let content;
+  if (!notifySupported()) {
+    content = h('p', { class: 'muted small' }, 'Ce navigateur ne gère pas les notifications. Sur iPhone, ajoute d’abord l’application à l’écran d’accueil (Partager → Sur l’écran d’accueil), puis ouvre-la depuis l’icône.');
+  } else if (Notification.permission === 'denied') {
+    content = h('p', { class: 'muted small' }, 'Notifications bloquées : autorise-les pour ce site dans les réglages du navigateur, puis reviens ici.');
+  } else if (notifyOn()) {
+    content = [
+      h('p', { class: 'muted small' }, '✅ Activées sur cet appareil.'),
+      h('button', { class: 'btn small', onclick: () => (store.setPref('notify', false), rerenderKeepScroll()) }, 'Désactiver'),
+    ];
+  } else {
+    content = h('button', { class: 'btn small primary', onclick: enableNotifications }, '🔔 Activer sur cet appareil');
+  }
+  return h(
+    'section',
+    { class: 'card' },
+    h('h2', { class: 'card-title' }, 'Notifications'),
+    h('p', { class: 'muted small' }, 'Être prévenu quand un autre membre ajoute une partie dans un de tes groupes. Sans serveur : l’app doit être ouverte ou en arrière-plan ; sinon les nouvelles parties sont signalées à la prochaine ouverture (pastille sur Historique).'),
+    content,
+  );
+}
+
+// Clic sur une notification : le service worker demande d'ouvrir l'historique
+navigator.serviceWorker?.addEventListener('message', (ev) => {
+  if (ev.data?.view && VIEWS[ev.data.view] && boot.appShown) go(ev.data.view);
+});
+
 async function showApp() {
   if (boot.appShown) return rerenderKeepScroll();
   boot.appShown = true;
@@ -2611,7 +2744,13 @@ async function showApp() {
   showTabbar(true);
   // Les sports et parties viennent d'arriver : la saisie reprend le dernier groupe et le dernier sport
   if (!state.editor.dirty && !state.editor.editing) state.editor = newEditor();
+  // Ouverture depuis une notification
+  if (location.hash === '#history') {
+    state.view = 'history';
+    history.replaceState(null, '', location.pathname + location.search);
+  }
   render();
+  checkNewGames();
   const legacy = store.legacyBackup();
   const target = store.getGroups().find((g) => g.id === editorGroup() && g.pid) || store.getGroups().find((g) => g.pid);
   if (legacy && target && confirm(`${plural(legacy.games.length, 'partie')} sont enregistrées uniquement sur ce téléphone. Les envoyer dans le groupe « ${target.name} » ?`)) {
@@ -2684,6 +2823,7 @@ function onDataChange() {
     boot.screen = '';
     return route();
   }
+  checkNewGames();
   // Nouveau groupe rejoint : choisir son joueur
   if (pendingWho()) return route();
   if (renderQueued) return;

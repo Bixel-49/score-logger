@@ -74,3 +74,21 @@ self.addEventListener('fetch', (event) => {
     })(),
   );
 });
+
+// Clic sur une notification "nouvelle partie" : on ouvre l'application sur l'historique
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const view = event.notification.data?.view || 'history';
+  event.waitUntil(
+    (async () => {
+      const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      const client = windows.find((c) => new URL(c.url).origin === self.location.origin);
+      if (client) {
+        await client.focus();
+        client.postMessage({ view });
+        return;
+      }
+      await self.clients.openWindow(`./#${view}`);
+    })(),
+  );
+});
