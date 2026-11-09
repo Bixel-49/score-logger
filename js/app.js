@@ -245,6 +245,8 @@ function touchEditor() {
 const meLabel = (gid = editorGroup()) => store.getMe(gid) || 'Moi';
 const sportsMap = () => new Map(store.getSports().map((s) => [s.id, s]));
 const sportLabel = (s) => (s ? `${s.icon} ${s.name}` : '❓ Sport supprimé');
+// Demander le nom du jeu ? Option du sport ; a defaut (sport cree avant l'option), les "jeux de societe" le demandent
+const isTitled = (s) => Boolean(s && (s.titled ?? /^jeux? de soci[eé]t[eé]s?$/i.test(s.name.trim())));
 
 // Filtre de groupe encore valable ?
 function groupFilter() {
@@ -343,7 +345,7 @@ const PRESETS = [
 const ICONS = ['🎾', '🏓', '🏸', '🎯', '⛳', '🎳', '🏀', '⚽', '🏐', '♟️', '🃏', '🎲', '🧩', '🀄', '🎮', '🏅'];
 
 function openSportSheet(sport, onSaved) {
-  const draft = { name: '', icon: '🏅', lowerWins: false, titled: false, ...sport };
+  const draft = { name: '', icon: '🏅', lowerWins: false, ...sport, titled: sport ? isTitled(sport) : false };
   const existing = store.getSports().map((s) => normalize(s.name));
   openSheet(sport ? 'Modifier le sport' : 'Nouveau sport ou jeu', (close) => {
     const save = async (value) => {
@@ -857,7 +859,7 @@ function gameRow(e, row, i, sports, { select }) {
   );
 
   // Nom du jeu (jeux de societe), avec les jeux deja saisis en suggestion
-  const titleField = sport?.titled
+  const titleField = isTitled(sport) || row.title
     ? [
         h('input', {
           class: 'input',
@@ -2281,7 +2283,13 @@ function renderSettingsView() {
               h(
                 'li',
                 {},
-                h('span', {}, sportLabel(s), s.lowerWins ? h('span', { class: 'muted small' }, ' · le plus petit score gagne') : null),
+                h(
+                  'span',
+                  {},
+                  sportLabel(s),
+                  s.lowerWins ? h('span', { class: 'muted small' }, ' · le plus petit score gagne') : null,
+                  isTitled(s) ? h('span', { class: 'muted small' }, ' · nom du jeu demandé') : null,
+                ),
                 h('button', { class: 'icon-btn', 'aria-label': `Modifier ${s.name}`, onclick: () => openSportSheet(s, rerenderKeepScroll) }, '✏️'),
                 h(
                   'button',
