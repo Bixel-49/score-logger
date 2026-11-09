@@ -1242,7 +1242,7 @@ td.bad-text {
 
 .prow {
   display: grid;
-  grid-template-columns: 1fr 96px 36px;
+  grid-template-columns: 1fr 124px 36px;
   gap: 8px;
   align-items: stretch;
 }
@@ -1431,7 +1431,7 @@ td.bad-text {
 
 .team-head {
   display: grid;
-  grid-template-columns: 1fr 110px auto;
+  grid-template-columns: 1fr 124px auto;
   align-items: center;
   gap: 8px;
 }
@@ -1475,4 +1475,33 @@ td.bad-text {
 .chip-x:focus-visible {
   background: var(--surface-2);
   color: var(--text);
+}
+
+/* Score + bouton ± (les claviers numeriques Android n'ont souvent pas de touche "-") */
+.score-box {
+  display: flex;
+  align-items: stretch;
+  gap: 4px;
+  min-width: 0;
+}
+
+.score-box .score-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.sign-btn {
+  flex: none;
+  width: 34px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-2);
+  color: var(--text);
+  font-size: 1.05rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.sign-btn:active {
+  background: var(--border);
 }

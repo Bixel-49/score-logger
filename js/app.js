@@ -561,22 +561,51 @@ function rowStatus(row, sports) {
   return [resultPill(o.result), o.rank != null && o.size > 2 ? h('span', { class: 'muted small' }, placeText(o.rank, o.size)) : null];
 }
 
-// Champ de score : nombres decimaux et negatifs acceptes
+// Texte saisi -> nombre ("2,5" et "-3" acceptes) ; null si vide ou incomplet ("-")
+function parseScore(text) {
+  const clean = text.replace(/\s/g, '').replace(',', '.');
+  if (clean === '' || clean === '-' || clean === '.') return null;
+  const n = Number(clean);
+  return Number.isFinite(n) ? n : null;
+}
+
+// Champ de score : nombres decimaux et negatifs acceptes.
+// Beaucoup de claviers numeriques Android n'ont pas de touche "-" : le bouton ± inverse le signe.
 function scoreInput(target, key, label, onchange) {
-  return h('input', {
+  const input = h('input', {
     class: 'input score-input',
-    type: 'number',
-    step: 'any',
+    type: 'text',
+    inputmode: 'decimal',
+    autocomplete: 'off',
     value: target[key] ?? '',
     placeholder: 'Score',
     'aria-label': `Score ${label}`,
     oninput: (ev) => {
-      const n = ev.target.value === '' ? null : Number(ev.target.value);
-      target[key] = Number.isFinite(n) ? n : null;
+      target[key] = parseScore(ev.target.value);
       touchEditor();
       onchange();
     },
   });
+  const sign = h(
+    'button',
+    {
+      type: 'button',
+      class: 'sign-btn',
+      'aria-label': `Changer le signe du score ${label}`,
+      title: 'Positif / négatif',
+      onclick: () => {
+        const text = input.value.trim();
+        // Champ vide : on commence la saisie d'un nombre negatif
+        input.value = text.startsWith('-') ? text.slice(1) : `-${text}`;
+        target[key] = parseScore(input.value);
+        touchEditor();
+        onchange();
+        input.focus();
+      },
+    },
+    '±',
+  );
+  return h('span', { class: 'score-box' }, input, sign);
 }
 
 function startNewGame() {
