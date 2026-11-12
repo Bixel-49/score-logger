@@ -520,6 +520,7 @@ function rowToRecord(e, row) {
     location: e.location.trim(),
     sport: row.sport,
     title: (row.title || '').trim(),
+    recordLower: typeof row.recordLower === 'boolean' ? row.recordLower : null,
     mode: mode === 'ffa' ? null : mode,
     me: row.me,
     teammates: mode === 'ffa' ? [] : (row.teammates || []).map(trim),
@@ -544,6 +545,7 @@ function recordToRow(r) {
     createdAt: r.createdAt,
     sport: r.sport,
     title: r.title || '',
+    recordLower: r.record ? r.record.lowerWins : r.recordLower ?? null,
     owner: r.owner || null,
     comments: r.comments || '',
     me: Number.isFinite(r.me) ? r.me : null,
@@ -568,9 +570,11 @@ function recordToRow(r) {
 // Record en cours de saisie : nouveau record, ou record actuel a battre
 function recordStatus(record, sport) {
   const current = store.recordInfo(record.group, record.sport, record.title, record.id);
+  const lower = current ? current.lowerWins : record.recordLower;
+  if (typeof lower !== 'boolean') return null;
   const scores = [record.me, ...record.opponents.map((o) => o.score)].filter(Number.isFinite);
-  const mine = scores.reduce((a, b) => (sport.lowerWins ? Math.min(a, b) : Math.max(a, b)));
-  if (!current || (sport.lowerWins ? mine < current.best : mine > current.best)) return [h('span', { class: 'muted small' }, '🏆 Nouveau record !')];
+  const mine = scores.reduce((a, b) => (lower ? Math.min(a, b) : Math.max(a, b)));
+  if (!current || (lower ? mine < current.best : mine > current.best)) return [h('span', { class: 'muted small' }, '🏆 Nouveau record !')];
   return [h('span', { class: 'muted small' }, `Record : ${formatScore(current.best)} (${current.holderName})`)];
 }
 
@@ -670,7 +674,12 @@ function saveEditor() {
     const owner = normalize(r.owner || store.getMe(r.group));
     const self = [...r.teammates, ...r.opponents.map((o) => o.name)].some((n) => normalize(n.trim()) === owner);
     const message = r.owner ? `${r.owner} apparaît deux fois dans la partie.` : 'Tu apparais deux fois dans la partie.';
-    return [...validate(r, sportsMap().get(r.sport)), ...(self ? [message] : [])];
+    const sport = sportsMap().get(r.sport);
+    const direction =
+      sport?.record && r.title && typeof r.recordLower !== 'boolean' && !store.recordInfo(r.group, r.sport, r.title, r.id)
+        ? ['Indique si c’est le plus grand ou le plus petit score qui gagne ce record.']
+        : [];
+    return [...validate(r, sport), ...direction, ...(self ? [message] : [])];
   };
   const errors = records.flatMap((r, i) => check(r).map((msg) => (e.rows.length > 1 ? `Partie ${e.rows.indexOf(rows[i]) + 1} : ${msg}` : msg)));
   if (errors.length) {
@@ -886,10 +895,12 @@ function gameRow(e, row, i, sports, { select }) {
   const showRecord = () => {
     if (!sport?.record) return;
     const info = store.recordInfo(editorGroup(), row.sport, row.title || '', row.id);
+    // Record existant : on reprend son sens
+    if (info) row.recordLower = info.lowerWins;
     recordLine.textContent = !(row.title || '').trim()
       ? 'Choisis un record existant ou crée-en un nouveau.'
       : info
-        ? `Record actuel : ${formatScore(info.best)} · ${info.holderName}`
+        ? `Record actuel : ${formatScore(info.best)} · ${info.holderName} (${info.lowerWins ? 'le plus petit gagne' : 'le plus grand gagne'})`
         : 'Nouveau record : le premier score l’établit.';
   };
   showRecord();
@@ -910,6 +921,8 @@ function gameRow(e, row, i, sports, { select }) {
               const creatingNow = ev.target.value === '__new';
               row.newRecord = creatingNow;
               row.title = creatingNow ? '' : ev.target.value;
+              // Nouveau record : le sens reste a choisir
+              if (creatingNow) delete row.recordLower;
               changed();
               if (creatingNow) requestAnimationFrame(() => document.querySelector(`[data-record-input="${i}"]`)?.focus());
             },
@@ -934,7 +947,52 @@ function gameRow(e, row, i, sports, { select }) {
           },
         })
       : null;
-    titleField = [recordSelect, nameInput, recordLine];
+    // Sens du record, propre a chaque record : a choisir pour un nouveau record,
+    // modifiable pour un record existant (toutes ses tentatives sont recalculees)
+    const existing = known && !creating ? store.recordInfo(editorGroup(), row.sport, row.title) : null;
+    if (existing) row.recordLower = existing.lowerWins;
+    const chooseDirection = (lower) => {
+      if (!existing) {
+        row.recordLower = lower;
+        changed();
+        return;
+      }
+      if (lower === existing.lowerWins) return;
+      if (!confirm(`Pour « ${known} », c’est désormais le plus ${lower ? 'petit' : 'grand'} score qui gagne ? Le classement de ce record sera recalculé.`)) return;
+      try {
+        store.setRecordDirection(editorGroup(), row.sport, row.title, lower);
+        row.recordLower = lower;
+        changed();
+      } catch (err) {
+        alert(err.message);
+      }
+    };
+    const direction = creating || existing
+      ? h(
+          'div',
+          { class: 'segmented small', role: 'radiogroup', 'aria-label': 'Qui gagne ce record ?' },
+          [
+            [false, '🔼 Le plus grand gagne'],
+            [true, '🔽 Le plus petit gagne'],
+          ].map(([lower, label]) =>
+            h(
+              'button',
+              {
+                type: 'button',
+                role: 'radio',
+                'aria-selected': String(row.recordLower === lower),
+                'aria-checked': String(row.recordLower === lower),
+                onclick: (ev) => {
+                  ev.stopPropagation();
+                  chooseDirection(lower);
+                },
+              },
+              label,
+            ),
+          ),
+        )
+      : null;
+    titleField = [recordSelect, nameInput, direction, recordLine];
   } else if (isTitled(sport) || row.title) {
     titleField = [
       h('input', {
@@ -1813,7 +1871,11 @@ function recordsCard(sport) {
           'h3',
           { class: 'sub-title' },
           sport ? r.name : `${sports.get(r.sport)?.icon || '🏆'} ${r.name}`,
-          h('span', { class: 'muted small' }, ` · ${plural(r.attempts, 'tentative')}${store.getGroups().length > 1 && !groupFilter() ? ` · ${store.groupName(r.group)}` : ''}`),
+          h(
+            'span',
+            { class: 'muted small' },
+            ` · ${r.lowerWins ? '🔽 le plus petit gagne' : '🔼 le plus grand gagne'} · ${plural(r.attempts, 'tentative')}${store.getGroups().length > 1 && !groupFilter() ? ` · ${store.groupName(r.group)}` : ''}`,
+          ),
         ),
         h(
           'table',
