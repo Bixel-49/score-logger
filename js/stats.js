@@ -7,7 +7,8 @@
 //   - equipes : me = score de mon equipe, teammates = mes coequipiers, opponents = joueurs adverses avec le score
 //     et le numero de leur equipe
 //   - cooperatif : teammates = les autres joueurs, opponents = [], result = 'W' ou 'L', me = score commun (facultatif)
-//   title : nom du jeu (jeux de societe), facultatif
+//   title : nom du jeu (jeux de societe), facultatif ; pour un sport "record" : nom du record
+//   record : { name, best, holderName, win, attempt } pour un record (voir store.js) ; win = je detiens le record
 // Un sport   : { id, name, icon, lowerWins, titled } ; lowerWins = le plus petit score gagne ; titled = demander le nom du jeu
 // Resultats : 'W' victoire, 'D' nul, 'L' defaite.
 
@@ -27,9 +28,30 @@ function otherTeams(game) {
 
 // Victoire = seul en tete ; nul = a egalite en tete ; defaite sinon.
 // rank / size : ma place et le nombre de participants (equipes en mode equipes ; null en cooperatif)
-// duels : resultat face a chaque adversaire (ai-je fait mieux que lui ?)
+// duels : resultat face a chaque adversaire. A plusieurs, seul le vainqueur bat les autres :
+//   un duel ne compte que si l'un des deux a gagne la partie (finir 2e ne bat pas le 3e)
 // partners : resultat partage avec chaque coequipier
+// Duels contre les adversaires (ou joueurs adverses) : scores = [{ name, score }]
+function duelsOf(me, scores, lowerWins) {
+  const best = [me, ...scores.map((o) => o.score)].reduce((a, b) => (compare(a, b, lowerWins) >= 0 ? a : b));
+  const top = (s) => compare(s, best, lowerWins) === 0;
+  return scores
+    .filter((o) => top(me) || top(o.score))
+    .map((o) => ({ name: o.name, result: sign(compare(me, o.score, lowerWins)) }));
+}
+
 export function outcome(game, sport) {
+  // Record : une seule victoire, celle du detenteur ; les autres participants perdent contre lui
+  if (game.record) {
+    const win = Boolean(game.record.win);
+    return {
+      result: win ? 'W' : 'L',
+      rank: null,
+      size: game.opponents.length + 1,
+      duels: win ? game.opponents.map((o) => ({ name: o.name, result: 'W' })) : game.opponents.filter((o) => o.name === game.record.holderName).map((o) => ({ name: o.name, result: 'L' })),
+      partners: [],
+    };
+  }
   const lowerWins = Boolean(sport?.lowerWins);
   const mode = modeOf(game);
   const teammates = game.teammates || [];
@@ -45,7 +67,7 @@ export function outcome(game, sport) {
       result,
       rank,
       size: diffs.length + 1,
-      duels: game.opponents.map((o) => ({ name: o.name, result: sign(compare(game.me, o.score, lowerWins)) })),
+      duels: duelsOf(game.me, game.opponents, lowerWins),
       partners: teammates.map((name) => ({ name, result })),
     };
   }
@@ -56,7 +78,7 @@ export function outcome(game, sport) {
     result,
     rank,
     size: game.opponents.length + 1,
-    duels: game.opponents.map((o, i) => ({ name: o.name, result: sign(diffs[i]) })),
+    duels: duelsOf(game.me, game.opponents, lowerWins),
     partners: [],
   };
 }
@@ -76,6 +98,7 @@ export function versusText(game) {
   const mode = modeOf(game);
   const mates = game.teammates || [];
   if (mode === 'coop') return mates.length ? `avec ${mates.join(', ')}` : 'en solo';
+  if (!game.opponents.length && !mates.length) return 'en solo';
   const vs = `vs ${game.opponents.map((o) => o.name).join(', ')}`;
   return mates.length ? `avec ${mates.join(', ')} · ${vs}` : vs;
 }
@@ -125,7 +148,7 @@ export function summary(games, sports) {
   return { ...total, streak, bestStreak, form: form.slice(-10), multi, avgRank: multi ? rankSum / multi : null };
 }
 
-// Face-a-face avec chaque adversaire (une partie a 4 compte comme 3 duels)
+// Face-a-face avec chaque adversaire (a plusieurs, seuls les duels avec le vainqueur comptent)
 export function byOpponent(games, sports) {
   const map = new Map();
   for (const g of games) {
@@ -238,6 +261,8 @@ export function opponentProfile(games, sports, name) {
   for (const g of together) {
     const sport = sports.get(g.sport);
     const duel = outcome(g, sport).duels.find((d) => d.name === name);
+    // Ni lui ni moi n'avons gagne : la partie est listee mais ne compte pas dans le bilan
+    if (!duel) continue;
     addTo(total, duel.result);
     if (!map.has(g.sport)) map.set(g.sport, { ...emptyTally(g.sport, sport?.name || '?'), icon: sport?.icon || '🏅' });
     addTo(map.get(g.sport), duel.result);
@@ -268,10 +293,12 @@ export function byDay(games, sports) {
 }
 
 // Problemes bloquants avant l'enregistrement (partie au format "vue par un joueur")
-export function validate(game) {
+// sport : pour un record, le nom du record est obligatoire et les autres participants facultatifs
+export function validate(game, sport = null) {
   const errors = [];
   const mode = modeOf(game);
   if (!game.sport) errors.push('Choisis le sport ou le jeu.');
+  if (sport?.record && !(game.title || '').trim()) errors.push('Indique de quel record il s’agit.');
   const others = [...(game.teammates || []), ...game.opponents.map((o) => o.name)].map((n) => n.trim());
   if (others.some((n) => !n)) errors.push('Un joueur n’a pas de nom.');
   if (new Set(others.filter(Boolean)).size !== others.filter(Boolean).length) errors.push('Un même joueur apparaît deux fois.');
@@ -280,7 +307,7 @@ export function validate(game) {
     return errors;
   }
   if (!Number.isFinite(game.me)) errors.push(mode === 'teams' ? 'Saisis le score de ton équipe.' : 'Saisis ton score.');
-  if (!game.opponents.length) errors.push(mode === 'teams' ? 'Ajoute au moins un joueur dans l’équipe adverse.' : 'Ajoute au moins un adversaire.');
+  if (!game.opponents.length && !sport?.record) errors.push(mode === 'teams' ? 'Ajoute au moins un joueur dans l’équipe adverse.' : 'Ajoute au moins un adversaire.');
   if (mode === 'teams') {
     const teams = new Map();
     for (const o of game.opponents) teams.set(o.team, o.score);

@@ -246,7 +246,7 @@ const meLabel = (gid = editorGroup()) => store.getMe(gid) || 'Moi';
 const sportsMap = () => new Map(store.getSports().map((s) => [s.id, s]));
 const sportLabel = (s) => (s ? `${s.icon} ${s.name}` : '❓ Sport supprimé');
 // Demander le nom du jeu ? Option du sport ; a defaut (sport cree avant l'option), les "jeux de societe" le demandent
-const isTitled = (s) => Boolean(s && (s.titled ?? /^jeux? de soci[eé]t[eé]s?$/i.test(s.name.trim())));
+const isTitled = (s) => Boolean(s && (s.record || (s.titled ?? /^jeux? de soci[eé]t[eé]s?$/i.test(s.name.trim()))));
 
 // Filtre de groupe encore valable ?
 function groupFilter() {
@@ -343,9 +343,10 @@ const PRESETS = [
   { name: 'Belote', icon: '🃏' },
   { name: 'Jeu de société', icon: '🎲', titled: true },
   { name: 'Golf', icon: '⛳', lowerWins: true },
+  { name: 'Record', icon: '🏆', record: true },
 ];
 
-const ICONS = ['🎾', '🏓', '🏸', '🎯', '⛳', '🎳', '🏀', '⚽', '🏐', '♟️', '🃏', '🎲', '🧩', '🀄', '🎮', '🏅'];
+const ICONS = ['🎾', '🏓', '🏸', '🎯', '⛳', '🎳', '🏀', '⚽', '🏐', '♟️', '🃏', '🎲', '🧩', '🀄', '🎮', '🏆', '⏱️', '🏅'];
 
 function openSportSheet(sport, onSaved) {
   const draft = { name: '', icon: '🏅', lowerWins: false, ...sport, titled: sport ? isTitled(sport) : false };
@@ -411,6 +412,12 @@ function openSportSheet(sport, onSaved) {
           { class: 'field toggle' },
           h('input', { type: 'checkbox', checked: Boolean(draft.titled), onchange: (ev) => (draft.titled = ev.target.checked) }),
           h('span', {}, 'Demander le nom du jeu à chaque partie (jeux de société : Catan, Dixit…)'),
+        ),
+        h(
+          'label',
+          { class: 'field toggle' },
+          h('input', { type: 'checkbox', checked: Boolean(draft.record), onchange: (ev) => (draft.record = ev.target.checked) }),
+          h('span', {}, 'Record : chaque partie est une tentative sur un record nommé ; seul le détenteur du meilleur score gagne'),
         ),
       ],
       actions: [h('button', { class: 'btn primary', onclick: () => save(draft) }, 'Enregistrer')],
@@ -558,11 +565,22 @@ function recordToRow(r) {
   return row;
 }
 
+// Record en cours de saisie : nouveau record, ou record actuel a battre
+function recordStatus(record, sport) {
+  const current = store.recordInfo(record.group, record.sport, record.title, record.id);
+  const scores = [record.me, ...record.opponents.map((o) => o.score)].filter(Number.isFinite);
+  const mine = scores.reduce((a, b) => (sport.lowerWins ? Math.min(a, b) : Math.max(a, b)));
+  if (!current || (sport.lowerWins ? mine < current.best : mine > current.best)) return [h('span', { class: 'muted small' }, '🏆 Nouveau record !')];
+  return [h('span', { class: 'muted small' }, `Record : ${formatScore(current.best)} (${current.holderName})`)];
+}
+
 // Pastille V / N / D et place, des que tous les scores sont saisis
 function rowStatus(row, sports) {
   const record = rowToRecord(state.editor, row);
-  if (validate(record).length) return null;
-  const o = outcome(record, sports.get(row.sport));
+  const sport = sports.get(row.sport);
+  if (validate(record, sport).length) return null;
+  if (sport?.record) return recordStatus(record, sport);
+  const o = outcome(record, sport);
   return [resultPill(o.result), o.rank != null && o.size > 2 ? h('span', { class: 'muted small' }, placeText(o.rank, o.size)) : null];
 }
 
@@ -652,7 +670,7 @@ function saveEditor() {
     const owner = normalize(r.owner || store.getMe(r.group));
     const self = [...r.teammates, ...r.opponents.map((o) => o.name)].some((n) => normalize(n.trim()) === owner);
     const message = r.owner ? `${r.owner} apparaît deux fois dans la partie.` : 'Tu apparais deux fois dans la partie.';
-    return [...validate(r), ...(self ? [message] : [])];
+    return [...validate(r, sportsMap().get(r.sport)), ...(self ? [message] : [])];
   };
   const errors = records.flatMap((r, i) => check(r).map((msg) => (e.rows.length > 1 ? `Partie ${e.rows.indexOf(rows[i]) + 1} : ${msg}` : msg)));
   if (errors.length) {
@@ -852,6 +870,8 @@ function gameRow(e, row, i, sports, { select }) {
           return;
         }
         row.sport = ev.target.value;
+        // Un record se saisit toujours en "chacun pour soi"
+        if (sports.get(row.sport)?.record && rowMode(row) !== 'ffa') setRowMode(row, 'ffa');
         // Le champ "Nom du jeu" apparait ou disparait selon le sport
         changed();
       },
@@ -861,23 +881,76 @@ function gameRow(e, row, i, sports, { select }) {
     h('option', { value: '__new' }, '➕ Nouveau sport ou jeu…'),
   );
 
-  // Nom du jeu (jeux de societe), avec les jeux deja saisis en suggestion
-  const titleField = isTitled(sport) || row.title
-    ? [
-        h('input', {
+  // Nom du jeu (jeux de societe) ou du record, avec les noms deja saisis en suggestion
+  const recordLine = h('p', { class: 'muted small record-line' });
+  const showRecord = () => {
+    if (!sport?.record) return;
+    const info = store.recordInfo(editorGroup(), row.sport, row.title || '', row.id);
+    recordLine.textContent = !(row.title || '').trim()
+      ? 'Choisis un record existant ou crée-en un nouveau.'
+      : info
+        ? `Record actuel : ${formatScore(info.best)} · ${info.holderName}`
+        : 'Nouveau record : le premier score l’établit.';
+  };
+  showRecord();
+  let titleField = null;
+  if (sport?.record) {
+    // Record : liste deroulante des records du groupe, ou "Nouveau record…" pour en saisir un
+    const names = store.getRecords(editorGroup(), row.sport).map((r) => r.name);
+    const title = normalize(row.title || '');
+    const known = names.find((n) => normalize(n) === title);
+    const creating = !names.length || row.newRecord || (title && !known);
+    const recordSelect = names.length
+      ? h(
+          'select',
+          {
+            class: 'input',
+            'aria-label': 'Record',
+            onchange: (ev) => {
+              const creatingNow = ev.target.value === '__new';
+              row.newRecord = creatingNow;
+              row.title = creatingNow ? '' : ev.target.value;
+              changed();
+              if (creatingNow) requestAnimationFrame(() => document.querySelector(`[data-record-input="${i}"]`)?.focus());
+            },
+          },
+          h('option', { value: '', disabled: true, selected: !creating && !known }, 'Choisir un record…'),
+          names.map((n) => h('option', { value: n, selected: !creating && n === known }, n)),
+          h('option', { value: '__new', selected: creating }, '➕ Nouveau record…'),
+        )
+      : null;
+    const nameInput = creating
+      ? h('input', {
           class: 'input',
-          list: `titles-${i}`,
-          placeholder: 'Nom du jeu (Catan, Dixit…)',
-          'aria-label': 'Nom du jeu',
+          'data-record-input': String(i),
+          placeholder: 'Nom du nouveau record (plus long échange…)',
+          'aria-label': 'Nom du nouveau record',
           value: row.title || '',
           oninput: (ev) => {
             row.title = ev.target.value;
             touchEditor();
+            showRecord();
+            refresh();
           },
-        }),
-        h('datalist', { id: `titles-${i}` }, store.getTitles(row.sport).map((t) => h('option', { value: t }))),
-      ]
-    : null;
+        })
+      : null;
+    titleField = [recordSelect, nameInput, recordLine];
+  } else if (isTitled(sport) || row.title) {
+    titleField = [
+      h('input', {
+        class: 'input',
+        list: `titles-${i}`,
+        placeholder: 'Nom du jeu (Catan, Dixit…)',
+        'aria-label': 'Nom du jeu',
+        value: row.title || '',
+        oninput: (ev) => {
+          row.title = ev.target.value;
+          touchEditor();
+        },
+      }),
+      h('datalist', { id: `titles-${i}` }, store.getTitles(row.sport).map((t) => h('option', { value: t }))),
+    ];
+  }
 
   const modeTabs = h(
     'div',
@@ -924,7 +997,7 @@ function gameRow(e, row, i, sports, { select }) {
                   changed();
                 }),
             },
-            h('span', { class: 'slot-label' }, `Adversaire ${row.opponents.length > 1 ? k + 1 : ''}`),
+            h('span', { class: 'slot-label' }, `${sport?.record ? 'Participant' : 'Adversaire'} ${row.opponents.length > 1 ? k + 1 : ''}`),
             h('span', { class: 'slot-name' }, o.name),
           ),
           scoreInput(o, 'score', o.name, refresh),
@@ -942,7 +1015,9 @@ function gameRow(e, row, i, sports, { select }) {
           ),
         ]),
       ),
-      h('button', { class: 'btn small ghost', onclick: () => pick('Ajouter un adversaire') }, '➕ Adversaire'),
+      sport?.record
+        ? h('button', { class: 'btn small ghost', onclick: () => pick('Ajouter un participant') }, '➕ Autre participant')
+        : h('button', { class: 'btn small ghost', onclick: () => pick('Ajouter un adversaire') }, '➕ Adversaire'),
     ];
   } else if (mode === 'teams') {
     row.teams ||= [];
@@ -1067,7 +1142,7 @@ function gameRow(e, row, i, sports, { select }) {
           )
         : null,
     ),
-    modeTabs,
+    sport?.record ? null : modeTabs,
     sportSelect,
     titleField,
     body,
@@ -1281,10 +1356,24 @@ function gameItem(g, sports, onclick) {
       'span',
       { class: 'match-main' },
       h('span', { class: 'match-name' }, gameLabel(g, sport), o.rank != null && o.size > 2 ? h('span', { class: 'muted' }, ` · ${placeText(o.rank, o.size)}`) : null),
-      h('span', { class: 'muted' }, `${modeOf(g) !== 'ffa' ? `${modeOf(g) === 'coop' ? '🤝' : '👥'} ` : ''}${versusText(g)}${groupSuffix(g)}`),
+      h(
+        'span',
+        { class: 'muted' },
+        g.record
+          ? `${recordText(g)}${g.opponents.length ? ` · ${versusText(g)}` : ''}${groupSuffix(g)}`
+          : `${modeOf(g) !== 'ffa' ? `${modeOf(g) === 'coop' ? '🤝' : '👥'} ` : ''}${versusText(g)}${groupSuffix(g)}`,
+      ),
     ),
     h('span', { class: 'match-score' }, scoreText(g)),
   );
+}
+
+// "🏆 Record détenu" / "Record : 12 (Paul)" ; pour un record reuni (stats), le nombre de tentatives
+function recordText(g) {
+  const r = g.record;
+  const tries = r.attempt ? '' : ` · ${plural(r.attempts, 'tentative')}`;
+  if (r.win) return `🏆 Record détenu${tries}`;
+  return `Record : ${formatScore(r.best)} (${r.holderName})${tries}`;
 }
 
 // Camps d'une partie du groupe, du meilleur au moins bon : [{ players: [{ name, key, score }], score }]
@@ -1314,7 +1403,11 @@ function groupGameItem(g, sports, onclick) {
   let headline;
   let detail;
   let score;
-  if (mode === 'coop') {
+  if (g.record) {
+    headline = g.record.holds ? ` · 🏆 Record de ${g.record.holderName}` : ' · tentative';
+    detail = `${list.map(sideName).join(', ')} · record ${formatScore(g.record.best)} (${g.record.holderName})`;
+    score = list.map((sd) => formatScore(sd.score)).join(' · ');
+  } else if (mode === 'coop') {
     headline = g.result === 'W' ? ' · 🏆 Gagné ensemble' : ' · 💀 Perdu ensemble';
     detail = g.players.map((p) => p.name).join(', ');
     score = Number.isFinite(list[0].score) ? formatScore(list[0].score) : '';
@@ -1360,6 +1453,16 @@ function openGameActions(g) {
         store.getGroups().length > 1 ? [h('dt', {}, 'Groupe'), h('dd', {}, store.groupName(g.group))] : null,
         g.location ? [h('dt', {}, 'Lieu'), h('dd', {}, g.location)] : null,
         mode !== 'ffa' ? [h('dt', {}, 'Mode'), h('dd', {}, MODES[mode])] : null,
+        g.record
+          ? [
+              h('dt', {}, 'Record'),
+              h(
+                'dd',
+                {},
+                `${formatScore(g.record.best)} · ${g.record.holderName}${g.record.attempt ? (g.record.holds ? ' (établi ici)' : '') : ` · ${plural(g.record.attempts, 'tentative')}`}`,
+              ),
+            ]
+          : null,
         mode === 'coop' ? [h('dt', {}, 'Résultat'), h('dd', {}, g.result === 'W' ? '🏆 Gagné' : '💀 Perdu')] : null,
         o && o.rank != null && o.size > 2 ? [h('dt', {}, 'Place'), h('dd', {}, placeText(o.rank, o.size))] : null,
         g.createdByName ? [h('dt', {}, 'Saisie par'), h('dd', {}, g.createdByName)] : null,
@@ -1551,7 +1654,7 @@ const PERIODS = {
 // Parties de la periode ; sport = '' pour tous les sports
 function periodGames(sport = state.sport) {
   const from = PERIODS[state.period].from();
-  return store.getGames(statsKey(), groupFilter()).filter((g) => g.date >= from && (!sport || g.sport === sport));
+  return store.getStatsGames(statsKey(), groupFilter()).filter((g) => g.date >= from && (!sport || g.sport === sport));
 }
 
 // Joueur dont on affiche les stats : moi, ou un autre joueur du groupe
@@ -1691,6 +1794,52 @@ function highlightRow(icon, label, t, detail, onclick) {
   );
 }
 
+// Classement de chaque record : meilleur score de chaque participant (toutes periodes) ; le joueur affiche en gras
+function recordsCard(sport) {
+  if (sport && !sport.record) return null;
+  const records = store.getRecords(groupFilter(), sport?.id || '');
+  if (!records.length) return null;
+  const sports = sportsMap();
+  const key = statsKey();
+  return h(
+    'section',
+    { class: 'card' },
+    h('h2', { class: 'card-title' }, 'Classement des records'),
+    records.map((r) =>
+      h(
+        'div',
+        { class: 'record-board' },
+        h(
+          'h3',
+          { class: 'sub-title' },
+          sport ? r.name : `${sports.get(r.sport)?.icon || '🏆'} ${r.name}`,
+          h('span', { class: 'muted small' }, ` · ${plural(r.attempts, 'tentative')}${store.getGroups().length > 1 && !groupFilter() ? ` · ${store.groupName(r.group)}` : ''}`),
+        ),
+        h(
+          'table',
+          { class: 'table' },
+          h(
+            'tbody',
+            {},
+            r.entries.map((en, k) => {
+              const label = `${k === 0 ? '🏆 ' : `${k + 1}. `}${en.name}`;
+              const me = en.key === key;
+              return h(
+                'tr',
+                {},
+                h('td', {}, me ? h('strong', {}, label) : label),
+                h('td', { class: 'muted small' }, shortDate(en.date)),
+                h('td', { class: 'num' }, me ? h('strong', {}, formatScore(en.score)) : formatScore(en.score)),
+              );
+            }),
+          ),
+        ),
+      ),
+    ),
+    h('p', { class: 'muted small' }, 'Meilleur score de chaque participant, toutes périodes confondues.'),
+  );
+}
+
 function renderStatsView() {
   const sports = sportsMap();
   const sport = sports.get(state.sport) || null;
@@ -1698,7 +1847,7 @@ function renderStatsView() {
   const games = periodGames();
   const sum = summary(games, sports);
   const hl = highlights(games, sports);
-  const played = new Set(store.getGames(statsKey(), groupFilter()).map((g) => g.sport));
+  const played = new Set(store.getStatsGames(statsKey(), groupFilter()).map((g) => g.sport));
   const selectSport = (id) => {
     state.sport = id;
     rerenderKeepScroll();
@@ -1716,7 +1865,11 @@ function renderStatsView() {
 
   let body;
   if (!games.length) {
-    body = h('p', { class: 'muted pad' }, store.getGames(statsKey(), groupFilter()).length ? 'Aucune partie sur cette période.' : 'Aucune partie pour l’instant.');
+    body = [
+      h('p', { class: 'muted pad' }, store.getStatsGames(statsKey(), groupFilter()).length ? 'Aucune partie sur cette période.' : 'Aucune partie pour l’instant.'),
+      // Le classement des records ne depend pas de la periode
+      recordsCard(sport),
+    ];
   } else {
     const streak = sum.streak.length ? `${sum.streak.length} ${RESULTS[sum.streak.result][1]}` : '–';
     const scores = sport ? scoreStats(games, sport) : null;
@@ -1786,7 +1939,7 @@ function renderStatsView() {
         { class: 'card' },
         h('h2', { class: 'card-title' }, 'Face-à-face'),
         tallyTable(byOpponent(games, sports), { label: 'Adversaire', onRow: (t) => openOpponentSheet(t.name) }),
-        h('p', { class: 'muted small' }, 'Dans une partie à plusieurs, chaque adversaire compte à part : as-tu fait mieux que lui ?'),
+        h('p', { class: 'muted small' }, 'Dans une partie à plusieurs, seul le vainqueur bat les autres : finir 2e compte une défaite contre le 1er, et rien contre ceux classés derrière.'),
       ),
       partners.length
         ? h(
@@ -1798,8 +1951,9 @@ function renderStatsView() {
           )
         : null,
       titles.length > 1 || (titles.length === 1 && titles[0].name !== 'Sans nom')
-        ? h('section', { class: 'card' }, h('h2', { class: 'card-title' }, 'Par jeu'), tallyTable(titles, { label: 'Jeu' }))
+        ? h('section', { class: 'card' }, h('h2', { class: 'card-title' }, sport?.record ? 'Par record' : 'Par jeu'), tallyTable(titles, { label: sport?.record ? 'Record' : 'Jeu' }))
         : null,
+      recordsCard(sport),
       modes.length > 1 ? h('section', { class: 'card' }, h('h2', { class: 'card-title' }, 'Par mode'), tallyTable(modes, { label: 'Mode' })) : null,
       sizes.length > 1
         ? h(
@@ -2292,7 +2446,7 @@ function renderSettingsView() {
                   {},
                   sportLabel(s),
                   s.lowerWins ? h('span', { class: 'muted small' }, ' · le plus petit score gagne') : null,
-                  isTitled(s) ? h('span', { class: 'muted small' }, ' · nom du jeu demandé') : null,
+                  s.record ? h('span', { class: 'muted small' }, ' · record') : isTitled(s) ? h('span', { class: 'muted small' }, ' · nom du jeu demandé') : null,
                 ),
                 h('button', { class: 'icon-btn', 'aria-label': `Modifier ${s.name}`, onclick: () => openSportSheet(s, rerenderKeepScroll) }, '✏️'),
                 h(

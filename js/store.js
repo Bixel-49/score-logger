@@ -661,6 +661,7 @@ export function setRevoked(memberUid, revoked) {
 // ---------------------------------------------------------------------------
 // Sports et jeux : { id, name, icon, lowerWins, titled } ; communs a tous les groupes
 // titled : demander le nom du jeu a chaque partie (jeux de societe)
+// record : chaque partie est une tentative sur un record nomme (title) ; seul le detenteur actuel gagne
 // ---------------------------------------------------------------------------
 
 export function getSports() {
@@ -668,7 +669,14 @@ export function getSports() {
 }
 
 export function saveSport(sport) {
-  const saved = { id: sport.id || uid(), name: sport.name.trim(), icon: (sport.icon || '').trim() || '🏅', lowerWins: Boolean(sport.lowerWins), titled: Boolean(sport.titled) };
+  const saved = {
+    id: sport.id || uid(),
+    name: sport.name.trim(),
+    icon: (sport.icon || '').trim() || '🏅',
+    lowerWins: Boolean(sport.lowerWins),
+    titled: Boolean(sport.titled),
+    record: Boolean(sport.record),
+  };
   const { id, ...fields } = saved;
   commit([{ type: 'set', col: 'sports', id, data: fields }]);
   return saved;
@@ -694,7 +702,15 @@ function view(gid, g) {
 
 // Partie vue par un joueur (par sa cle), ou null s'il n'y a pas participe.
 // Voir stats.js pour le format : me, opponents (avec team en mode equipes), teammates.
+// Partie vue par un joueur ; pour un record, record.win = ce joueur detient le record
+// (pour une tentative : seulement celle qui a etabli le record actuel)
 export function perspective(g, key) {
+  const p = basePerspective(g, key);
+  if (p && g.record) p.record = { ...g.record, win: g.record.holderKey === key && (!g.record.attempt || g.record.holds) };
+  return p;
+}
+
+function basePerspective(g, key) {
   const me = g.players.find((p) => p.key === key);
   if (!me) return null;
   const others = g.players.filter((p) => p !== me);
@@ -722,7 +738,119 @@ export function getAllGames(groupId = '') {
     if (groupId && gid !== groupId) continue;
     for (const g of games.values()) if (Array.isArray(g.players)) list.push(view(gid, g));
   }
+  annotateRecords(list);
   return list;
+}
+
+// ---------------------------------------------------------------------------
+// Records : un sport "record" ; chaque partie est une tentative sur un record nomme (title), par groupe.
+// Le premier a atteindre le meilleur score detient le record (il faut faire strictement mieux pour le prendre).
+// ---------------------------------------------------------------------------
+
+const better = (a, b, lowerWins) => (lowerWins ? a < b : a > b);
+const recordId = (gid, sportId, title) => `${gid}|${sportId}|${normalize(title)}`;
+const attemptOrder = (a, b) => a.date.localeCompare(b.date) || String(a.createdAt || '').localeCompare(String(b.createdAt || ''));
+
+// Detenteur d'un record a partir de ses tentatives : { name, best, holder: { key, name }, game, date }
+function standing(attempts, sport) {
+  const st = { name: attempts[0].title.trim(), best: null, holder: null, game: null, date: null };
+  for (const g of [...attempts].sort(attemptOrder)) {
+    for (const p of g.players) {
+      if (!Number.isFinite(p.score)) continue;
+      if (st.best === null || better(p.score, st.best, sport?.lowerWins)) Object.assign(st, { best: p.score, holder: { key: p.key, name: p.name }, game: g, date: g.date });
+    }
+  }
+  return st;
+}
+
+// Ajoute g.record aux tentatives : { id, name, best, holderKey, holderName, date, holds (cette tentative a etabli le record), attempt: true }
+function annotateRecords(list) {
+  const records = new Map();
+  for (const g of list) {
+    if (!data.sports.get(g.sport)?.record || !(g.title || '').trim()) continue;
+    const id = recordId(g.group, g.sport, g.title);
+    if (!records.has(id)) records.set(id, []);
+    records.get(id).push(g);
+  }
+  for (const [id, attempts] of records) {
+    const st = standing(attempts, data.sports.get(attempts[0].sport));
+    for (const g of attempts) {
+      g.record = { id, name: st.name, best: st.best, holderKey: st.holder?.key || null, holderName: st.holder?.name || '', date: st.date, holds: g === st.game, attempt: true };
+    }
+  }
+}
+
+// Record actuel (pour la saisie) : { best, holderName } ou null ; exceptId : tentative en cours de modification
+export function recordInfo(gid, sportId, title, exceptId = null) {
+  if (!title?.trim()) return null;
+  const id = recordId(gid, sportId, title);
+  const attempts = getAllGames(gid).filter((g) => g.record?.id === id && g.id !== exceptId);
+  if (!attempts.length) return null;
+  const st = standing(attempts, data.sports.get(sportId));
+  return st.best === null ? null : { best: st.best, holderName: st.holder.name };
+}
+
+// Records et leur classement : [{ id, name, sport, group, best, holderKey, holderName, attempts,
+//   entries: [{ key, name, score, date }] }] ; entries = meilleur score de chaque participant, le detenteur en premier
+export function getRecords(groupId = '', sportId = '') {
+  const map = new Map();
+  const attempts = getAllGames(groupId)
+    .filter((g) => g.record && (!sportId || g.sport === sportId))
+    .sort(attemptOrder);
+  for (const g of attempts) {
+    let r = map.get(g.record.id);
+    if (!r) {
+      r = { id: g.record.id, name: g.record.name, sport: g.sport, group: g.group, best: g.record.best, holderKey: g.record.holderKey, holderName: g.record.holderName, attempts: 0, entries: new Map() };
+      map.set(g.record.id, r);
+    }
+    r.attempts += 1;
+    const lowerWins = data.sports.get(g.sport)?.lowerWins;
+    for (const p of g.players) {
+      if (!Number.isFinite(p.score)) continue;
+      const cur = r.entries.get(p.key);
+      // A score egal, on garde la premiere fois
+      if (!cur || better(p.score, cur.score, lowerWins)) r.entries.set(p.key, { key: p.key, name: p.name, score: p.score, date: g.date });
+    }
+  }
+  return [...map.values()]
+    .map((r) => {
+      const lowerWins = data.sports.get(r.sport)?.lowerWins;
+      const entries = [...r.entries.values()].sort(
+        (a, b) =>
+          (b.key === r.holderKey) - (a.key === r.holderKey) || (lowerWins ? a.score - b.score : b.score - a.score) || a.date.localeCompare(b.date),
+      );
+      return { ...r, entries };
+    })
+    .sort((a, b) => byName(a.name, b.name));
+}
+
+// Parties pour les statistiques : les tentatives d'un meme record sont reunies en une seule partie,
+// avec le meilleur score de chaque participant : une victoire pour le detenteur, une defaite pour les autres
+export function getStatsGames(key = myKey(), groupId = '') {
+  if (!key) return [];
+  const merged = new Map();
+  const out = [];
+  for (const g of getAllGames(groupId)) {
+    if (!g.record) {
+      out.push(g);
+      continue;
+    }
+    let m = merged.get(g.record.id);
+    if (!m) {
+      m = { id: `record:${g.record.id}`, group: g.group, sport: g.sport, title: g.record.name, date: g.record.date, mode: null, location: '', comments: '', players: [], record: { ...g.record, attempt: false, holds: false, attempts: 0 } };
+      merged.set(g.record.id, m);
+      out.push(m);
+    }
+    m.record.attempts += 1;
+    const lowerWins = data.sports.get(g.sport)?.lowerWins;
+    for (const p of g.players) {
+      if (!Number.isFinite(p.score)) continue;
+      const cur = m.players.find((x) => x.key === p.key);
+      if (!cur) m.players.push({ ...p });
+      else if (better(p.score, cur.score, lowerWins)) cur.score = p.score;
+    }
+  }
+  return out.map((g) => perspective(g, key)).filter(Boolean);
 }
 
 // Parties d'un joueur (moi par defaut), de son point de vue
@@ -742,6 +870,8 @@ export function getPlayerKeys(groupId = '') {
 
 // Meme regle que firestore.rules : l'auteur, les joueurs de la partie, le responsable du groupe et les administrateurs
 export function canEdit(g) {
+  // Record reuni pour les statistiques : on modifie les tentatives, pas l'ensemble
+  if (String(g.id).startsWith('record:')) return false;
   return canManage(g.group) || g.createdBy === session.uid || (g.pids || []).includes(myPid(g.group));
 }
 

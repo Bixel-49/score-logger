@@ -1532,3 +1532,13 @@ td.bad-text {
 .sign-btn:active {
   background: var(--border);
 }
+
+/* Record actuel sous le champ "Quel record ?" */
+.record-line {
+  margin: -4px 0 0;
+}
+
+/* Classement d'un record dans les stats */
+.record-board + .record-board {
+  margin-top: 12px;
+}
