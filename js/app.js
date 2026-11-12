@@ -1360,7 +1360,7 @@ function gameItem(g, sports, onclick) {
         'span',
         { class: 'muted' },
         g.record
-          ? `${recordText(g)}${g.opponents.length ? ` · ${versusText(g)}` : ''}${groupSuffix(g)}`
+          ? `${recordStanding(g)}${g.opponents.length ? ` · ${versusText(g)}` : ''}${groupSuffix(g)}`
           : `${modeOf(g) !== 'ffa' ? `${modeOf(g) === 'coop' ? '🤝' : '👥'} ` : ''}${versusText(g)}${groupSuffix(g)}`,
       ),
     ),
@@ -1369,7 +1369,7 @@ function gameItem(g, sports, onclick) {
 }
 
 // "🏆 Record détenu" / "Record : 12 (Paul)" ; pour un record reuni (stats), le nombre de tentatives
-function recordText(g) {
+function recordStanding(g) {
   const r = g.record;
   const tries = r.attempt ? '' : ` · ${plural(r.attempts, 'tentative')}`;
   if (r.win) return `🏆 Record détenu${tries}`;
